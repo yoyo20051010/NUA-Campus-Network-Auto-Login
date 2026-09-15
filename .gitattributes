@@ -1,0 +1,16 @@
+# 统一换行符，避免跨平台协作时出问题
+* text=auto
+
+# Linux / 路由器脚本必须是 LF，否则在 OpenWrt 上会报 "bad interpreter"
+*.sh    text eol=lf
+*.init  text eol=lf
+
+# Windows 脚本保持 CRLF
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+
+# 其余文本文件统一 LF
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf

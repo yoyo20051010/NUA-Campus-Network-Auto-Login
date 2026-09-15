@@ -1,0 +1,23 @@
+{
+  "_说明": "OpenWrt 版配置。不填也能用，下面是内置默认值。",
+  "portal_url": "http://10.255.255.2/",
+  "cas_login_url": "https://c.nua.edu.cn/cas/login",
+  "service": "https://c.nua.edu.cn/cas/wifiLogin/innerLogin.jsp",
+  "status_url": "https://c.nua.edu.cn/cas/wifiLogin/isLogin",
+  "_captcha_url说明": "实际地址由脚本从验证页的 contextPath 自动推导，这里只是后备值",
+  "captcha_url": "https://c.nua.edu.cn/cas/captchValid/checkCaptchImg",
+  "_wifi_suffix说明": "无线网(校园WiFi)登录用的服务类型后缀。留空=自动依次尝试 无/@njxy/@dx/@lt；如果你知道自己属于哪种，填上可减少尝试次数，例如 \"@dx\"",
+  "wifi_suffix": "",
+  "probe_url": "http://www.baidu.com/",
+  "interval": 60,
+  "login_timeout": 90,
+  "timeout": 8,
+  "_quiet_hours说明": "夜间限制时段：学校不允许学生账号认证的时段，脚本不尝试登录也不发请求。days 0=周一 … 6=周日，默认周一~周五 00:00-06:00。",
+  "quiet_hours": {
+    "enabled": true,
+    "start": "00:00",
+    "end": "06:00",
+    "days": [0, 1, 2, 3, 4]
+  },
+  "failure_backoff": [120, 300, 900, 1800]
+}

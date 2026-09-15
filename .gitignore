@@ -1,0 +1,22 @@
+# ---- 凭据（千万不要提交）----
+secret.json
+secret.bin
+
+# ---- 运行产物 ----
+logs/
+screenshots/
+browser-profile/
+__pycache__/
+*.py[cod]
+*.log
+
+# ---- 打包产物与自带运行环境（由 tools/make_release.ps1 生成，不入库）----
+*.zip
+runtime/
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
