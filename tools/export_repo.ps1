@@ -25,9 +25,13 @@ if (Test-Path -LiteralPath $Destination) {
     if ($destFull -notmatch 'NUA-Campus-Network-Auto-Login$') {
         throw "导出目录名不符，已中止：$destFull"
     }
-    Remove-Item -LiteralPath $Destination -Recurse -Force
+    # 保留 .git（否则会把 git 仓库、远程配置和推送记录一起删掉）
+    Get-ChildItem -LiteralPath $Destination -Force |
+        Where-Object { $_.Name -ne '.git' } |
+        Remove-Item -Recurse -Force
+} else {
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 }
-New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 
 # 白名单：只会复制这里列出的东西
 $files = @(
