@@ -26,7 +26,7 @@
 
 ### 方式一：下载安装包（推荐，零依赖）
 
-在 [Releases](../../releases) 里下载 `校园网自动登录_v*_标准版.zip`（约 13MB，**自带 Python 运行环境**），
+在 [Releases](../../releases) 里下载 `NUA-Campus-Network-Auto-Login_v*_standard.zip`（约 13MB，**自带 Python 运行环境**），
 解压后双击 `AAA一键安装.bat`，按向导输入校园网账号密码即可。
 
 ### 方式二：从源码运行
