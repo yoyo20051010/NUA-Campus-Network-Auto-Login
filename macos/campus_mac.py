@@ -1662,8 +1662,11 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
 
     log.error("Dr.COM 门户登录失败(试过 %s 种服务类型)", len(forms))
     if errors and all(("Authentication fail" in e or "账号错误" in e) for e in errors):
-        log.error("所有服务类型都被拒 —— 通常是账号密码不对; "
-                  "也可能是这家运营商还没绑定账号(提示里会写「请先绑定运营商账号」)")
+        log.error("所有服务类型都被拒。常见原因:")
+        log.error("  1) 账号密码不对")
+        log.error("  2) 换了一张校园网(比如从移动换到电信), 但这张网的账号还没存过 ——")
+        log.error("     连着这张网运行一次:  python3 campus_mac.py --set-password")
+        log.error("  3) 这家运营商还没绑定账号(提示里会写「请先绑定运营商账号」)")
     return False
 
 
