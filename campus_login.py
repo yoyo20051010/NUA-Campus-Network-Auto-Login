@@ -69,6 +69,12 @@ DEFAULT_CONFIG = {
         "end": "06:00",
         "days": [0, 1, 2, 3, 4],
     },
+    # 教师账号（工号，M 开头）所有时段都能认证，不受夜间限制时段影响；
+    # 学生账号（学号，B 开头）只有周六日 24 小时可用，非周六日 00:00-06:00 无法认证
+    # —— 正好对应上面 quiet_hours 的 days=[0,1,2,3,4]。
+    # 两张校园网（移动/电信）上学生账号和教师账号是混着用的，所以按**账号**判断，不按网段。
+    "teacher_account_prefixes": ["M"],
+    "quiet_hours_exempt_accounts": [],
     # 登录失败后的退避秒数：2 分钟、5 分钟、15 分钟、30 分钟（之后一直 30 分钟）
     "failure_backoff": [120, 300, 900, 1800],
 }
@@ -324,8 +330,51 @@ def _hhmm_to_minutes(text: str) -> int | None:
         return None
 
 
-def in_quiet_hours(cfg: dict, now: datetime.datetime | None = None) -> bool:
-    """当前是否处在学校禁止认证的时段（默认周一~周五 00:00-06:00）。"""
+def quiet_hours_exempt(cfg: dict, account: str) -> bool:
+    """
+    某些账号不受夜间限制时段影响。
+
+    实测（2026-09，南艺）学校对不同账号的时段限制不一样，**而且和连哪张校园网无关**：
+      · 学生账号（学号，B 开头）→ 只有周六日 24 小时可用；
+                                  非周六日 00:00-06:00 无法认证
+      · 教师账号（工号，M 开头）→ 所有时段都可用
+
+    两张校园网（移动 / 电信）上都是学生账号 + 教师账号混着用，所以这里必须按
+    **账号**判断，不能按网段判断。教师账号在夜间限制时段里也要照常工作，
+    否则半夜掉线就不会自动重连 —— 而那个时间恰恰是能认证的。
+
+    配置：teacher_account_prefixes（默认 ["M"]）、quiet_hours_exempt_accounts
+    """
+    account = (account or "").strip()
+    if not account:
+        return False
+    prefixes = cfg.get("teacher_account_prefixes") or ["M"]
+    for prefix in prefixes:
+        prefix = str(prefix).strip()
+        if prefix and account.upper().startswith(prefix.upper()):
+            return True
+    exempt = cfg.get("quiet_hours_exempt_accounts") or []
+    return any(account == str(name).strip() for name in exempt)
+
+
+def saved_account() -> str:
+    """取已保存的账号（没保存过就返回空串）—— 用来判断这个账号是否受夜间限制。"""
+    try:
+        return load_secret()[0]
+    except SystemExit:
+        return ""
+
+
+def in_quiet_hours(cfg: dict, now: datetime.datetime | None = None, account: str = "") -> bool:
+    """
+    当前是否处在学校禁止认证的时段（默认周一~周五 00:00-06:00）。
+
+    注意 days 默认 [0,1,2,3,4]（周一~周五）正好对应学生账号的规则 ——
+    因为学生账号**周末是 24 小时可用的**，所以周末本来就不该静默。
+    教师账号（M 开头）在这里被豁免，所有时段都照常检查。
+    """
+    if quiet_hours_exempt(cfg, account):
+        return False
     quiet = cfg.get("quiet_hours") or {}
     if not quiet.get("enabled"):
         return False
@@ -343,7 +392,7 @@ def in_quiet_hours(cfg: dict, now: datetime.datetime | None = None) -> bool:
     current = now.hour * 60 + now.minute
     if start <= end:
         return start <= current < end
-    return current >= start or current < end
+    return current >= start or current < end       # 跨天的情况
 
 
 def note_mode(mode: str, message: str) -> bool:
@@ -918,7 +967,7 @@ def cmd_login(cfg: dict) -> int:
     """
     now_ts = time.time()
 
-    if in_quiet_hours(cfg):
+    if in_quiet_hours(cfg, account=saved_account()):
         quiet = cfg.get("quiet_hours") or {}
         note_mode("quiet", f"进入夜间限制时段（{quiet.get('start', '00:00')}-{quiet.get('end', '06:00')}），"
                            "学校此时不允许学生账号认证，暂停尝试")
@@ -961,7 +1010,7 @@ def cmd_watch(cfg: dict) -> int:
     log.info("看门狗启动, 每 %s 秒检测一次", interval)
     while True:
         try:
-            if in_quiet_hours(cfg):
+            if in_quiet_hours(cfg, account=account):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段（{quiet.get('start', '00:00')}-{quiet.get('end', '06:00')}），"
                                    "学校此时不允许学生账号认证，暂停尝试")

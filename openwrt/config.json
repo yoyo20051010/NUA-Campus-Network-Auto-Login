@@ -17,9 +17,25 @@
     "enabled": true,
     "start": "00:00",
     "end": "06:00",
-    "days": [0, 1, 2, 3, 4]
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
-  "failure_backoff": [120, 300, 900, 1800],
+  "_teacher账号说明": "教师账号前缀（默认 M）：这类账号所有时段都能认证，不受夜间限制时段影响。学生账号（学号 B 开头）只有周六日 24 小时可用，非周六日 00:00-06:00 无法认证 —— 正好对应 quiet_hours 的 days=[0,1,2,3,4]。",
+  "teacher_account_prefixes": [
+    "M"
+  ],
+  "quiet_hours_exempt_accounts": [],
+  "failure_backoff": [
+    120,
+    300,
+    900,
+    1800
+  ],
   "_wired_flow说明": "有线网段用哪套登录：drcom=直接走 Dr.COM 表单（默认，可绕开统一认证的滑块/人脸验证）；cas=强制走统一身份认证。失败会自动用另一套再试。",
   "wired_flow": "drcom"
 }

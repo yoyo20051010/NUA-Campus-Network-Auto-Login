@@ -11,6 +11,12 @@
   "_accounts说明": "按网段记的账号: 键是客户端 IP 前两段(如 10.53)。移动/电信/联通的 Wi-Fi 账号不同时, 各连一次各存一次即可, 用 --set-password 自动写入。",
   "accounts": {},
   "keychain_service": "campus-net-login",
+  "version": "v1.3-macos",
+  "_version说明": "本机版本号, 与 Release 的 tag 保持一致; 用于检查更新",
+  "notify": true,
+  "_notify说明": "登录成功/失败/掉线时弹 macOS 系统通知; 不想被打扰就改成 false",
+  "update_api": "https://api.github.com/repos/zacharyli001/NUA-Campus-Network-Auto-Login/releases?per_page=1",
+  "_update_api说明": "检查更新用的接口(最多 12 小时查一次, 失败静默)。用 /releases 列表而不是 /latest, 因为预发布版本 /latest 查不到",
   "interface": "",
   "cas_ip_ranges": [
     [
@@ -58,5 +64,10 @@
   ],
   "_failure_backoff说明": "登录失败后的重试间隔(秒), 依次取用; 成功一次立刻恢复常规检查",
   "wired_flow": "drcom",
-  "_wired_flow说明": "有线默认也走 Dr.COM 表单: 实测可行, 且能绕过学校统一认证的『人脸识别』(那条路需要真人刷脸, 自动化不了)。想强制走统一认证改成 cas"
+  "_wired_flow说明": "有线默认也走 Dr.COM 表单: 实测可行, 且能绕过学校统一认证的『人脸识别』(那条路需要真人刷脸, 自动化不了)。想强制走统一认证改成 cas",
+  "teacher_account_prefixes": [
+    "M"
+  ],
+  "_teacher说明": "教师账号前缀(默认 M): 所有时段都可用, 不受夜间静默限制。学生账号(B 开头学号)只有周六日 24 小时可用, 非周六日 0-6 点登不上 —— 正好对应 quiet_hours 的 days=[0,1,2,3,4]。",
+  "quiet_hours_exempt_accounts": []
 }

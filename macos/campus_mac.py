@@ -958,9 +958,51 @@ def _hhmm_to_minutes(value):
         return None
 
 
-def in_quiet_hours(cfg: dict, now=None) -> bool:
+def current_source_ip(cfg: dict) -> str:
+    """
+    取当前出口地址 —— 只查路由表和网卡, **不发任何包**。
+    用于夜间静默这种"连探测请求都不该发"的场景。
+    """
+    host = urllib.parse.urlsplit(cfg.get("portal_url", "")).hostname or "10.255.255.2"
+    iface = (route_get(host) or {}).get("interface") or ""
+    if not iface:
+        return ""
+    return (iface_addresses().get(iface) or {}).get("ipv4", "")
+
+
+def quiet_hours_exempt(cfg: dict, account: str) -> bool:
+    """
+    某些账号不受夜间静默限制。
+
+    学校规则(实测确认):
+      · 学生账号(学号, B 开头) → 只有周六日 24 小时可用;
+                                   非周六日的 00:00-06:00 登不上
+      · 教师账号(工号, M 开头) → 所有时段都可用
+
+    **两张校园网(移动/电信)都同时有学生和教师账号**, 所以静默必须按
+    【账号】判断, 而不是按网段 —— 同一个网段上两种账号都有。
+
+    因此:
+      quiet_hours 的 days 保持 [0,1,2,3,4](周一~周五) 就正好是学生账号的规则;
+      教师账号(M 开头)在这里豁免, 不受静默限制。
+
+    配置: "teacher_account_prefixes": ["M"], "quiet_hours_exempt_accounts": []
+    """
+    exempt = cfg.get("quiet_hours_exempt_accounts") or []
+    account = (account or "").strip()
+    if not account:
+        return False
+    prefixes = cfg.get("teacher_account_prefixes") or ["M"]
+    if any(account.upper().startswith(str(p).strip().upper()) for p in prefixes if str(p).strip()):
+        return True                      # 教师账号: 24 小时可用, 不静默
+    return any(account == str(a).strip() for a in exempt)
+
+
+def in_quiet_hours(cfg: dict, now=None, account: str = "") -> bool:
     """当前是否处在学校禁止认证的时段(默认周一~周五 00:00-06:00)。"""
     import datetime as _dt
+    if quiet_hours_exempt(cfg, account):
+        return False        # 该账号 24 小时可用, 不静默
     quiet = cfg.get("quiet_hours") or {}
     if not quiet.get("enabled"):
         return False
@@ -1812,6 +1854,116 @@ def release_lock() -> None:
         pass
 
 
+
+# --------------------------------------------------------------------------- #
+# 版本 / 通知 / 更新检查
+# --------------------------------------------------------------------------- #
+VERSION = "1.1"
+DEFAULT_UPDATE_API = ("https://api.github.com/repos/zacharyli001/"
+                      "NUA-Campus-Network-Auto-Login/releases?per_page=1")
+UPDATE_CHECK_FILE = STATE_DIR / "update_check.json"
+
+
+def notify(title: str, message: str, cfg: dict | None = None) -> None:
+    """
+    弹一条 macOS 通知。失败就静默忽略 —— 通知绝不能影响主流程。
+    (用系统自带的 osascript, 不引入任何依赖)
+    """
+    if cfg is not None and cfg.get("notify") is False:
+        return
+    try:
+        safe_title = title.replace('"', "'").replace("\\", "")[:80]
+        safe_body = message.replace('"', "'").replace("\\", "")[:200]
+        subprocess.run(
+            ["/usr/bin/osascript", "-e",
+             f'display notification "{safe_body}" with title "{safe_title}"'],
+            capture_output=True, timeout=8)
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
+def check_update(cfg: dict, force: bool = False) -> str:
+    """
+    查 GitHub Release 有没有新版本。返回一句说明(没有新版本则返回 "")。
+    最多 12 小时查一次; 失败静默(不联网/被墙都不影响主流程)。
+    """
+    now = time.time()
+    last = 0.0
+    try:
+        last = float(json.loads(UPDATE_CHECK_FILE.read_text(encoding="utf-8"))
+                     .get("ts", 0))
+    except (OSError, ValueError):
+        last = 0.0
+    if not force and now - last < 12 * 3600:
+        return ""
+    try:
+        STATE_DIR.mkdir(exist_ok=True)
+        UPDATE_CHECK_FILE.write_text(json.dumps({"ts": now}), encoding="utf-8")
+    except OSError:
+        pass
+
+    url = cfg.get("update_api") or DEFAULT_UPDATE_API
+    code, out = sh(["/usr/bin/curl", "-sL", "-m", "10",
+                    "-H", "Accept: application/vnd.github+json", url], timeout=15)
+    if code != 0 or not out.strip():
+        return ""
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return ""
+    # /releases 返回的是列表; /releases/latest 返回单个对象。两种都兼容。
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return ""
+    tag = str(data.get("tag_name") or "").strip()
+    mine = str(cfg.get("version") or VERSION).strip()
+    if not tag or tag == mine:
+        return ""
+    return f"有新版本 {tag}（当前 {mine}）: {data.get('html_url') or url}"
+
+
+def cmd_status(cfg: dict, net: NetEnv) -> int:
+    """给普通人看的简明状态(双击「查看状态」用的就是它)。"""
+    net.select()
+    state, detail, _ = evaluate(cfg, net)
+    icon = {STATE_ONLINE: "✅", STATE_OFFLINE_CAMPUS: "⚠️",
+            STATE_NOT_CAMPUS: "➖"}.get(state, "❓")
+    account = account_for(cfg, net.source_ip) or "（未配置）"
+
+    running = False
+    code, out = sh(["/usr/bin/pgrep", "-f", "campus_mac.py --watch"])
+    running = code == 0 and out.strip() != ""
+
+    last_login = ""
+    try:
+        for line in reversed(LOG_DIR.joinpath("campus_mac.log")
+                             .read_text(encoding="utf-8", errors="ignore").splitlines()):
+            if "登录成功" in line:
+                last_login = line.strip()
+                break
+    except OSError:
+        pass
+
+    print("=" * 62)
+    print(f"  校园网自动登录 · 当前状态      （版本 {cfg.get('version') or VERSION}）")
+    print("=" * 62)
+    print(f"  {icon} {STATE_TEXT.get(state, state)}")
+    print(f"      出口地址：{net.source_ip or '-'}   （{net.iface or '-'}）")
+    print(f"      使用账号：{account}")
+    print(f"      后台服务：{'运行中 ✅' if running else '未运行 ⚠️  （双击 AAA一键安装.command 重新安装）'}")
+    if last_login:
+        print(f"      最近登录：{last_login.split(' INFO ')[-1][:60]}")
+    print("-" * 62)
+    update = check_update(cfg)
+    if update:
+        print(f"  🔔 {update}")
+        print("-" * 62)
+    print(f"  详细日志：{LOG_DIR / 'campus_mac.log'}")
+    print("=" * 62)
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # 命令
 # --------------------------------------------------------------------------- #
@@ -1963,12 +2115,14 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
     while True:
         try:
             # ① 夜间静默: 学校这段时间不允许学生账号认证, 完全不发请求
-            if in_quiet_hours(cfg):
+            #    (但有些账号 24 小时可用, 那种账号不静默 —— 按账号判断, 不按网段)
+            quiet_account = account_for(cfg, net.source_ip or current_source_ip(cfg))
+            if in_quiet_hours(cfg, account=quiet_account):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", "进入夜间静默时段 %s-%s: 学校这段时间不让认证, "
                                    "暂停所有网络请求, 到点自动恢复" % (
                                        quiet.get("start", "00:00"), quiet.get("end", "06:00")))
-                while in_quiet_hours(cfg):
+                while in_quiet_hours(cfg, account=quiet_account):
                     wait_for_change(300)
                 note_mode("normal", "夜间静默时段结束, 恢复常规检查")
                 state = STATE_UNKNOWN
@@ -1976,7 +2130,10 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
 
             net.select()
             state, detail, _ = evaluate(cfg, net)
-            note_state(state, detail)
+            changed = note_state(state, detail)
+            if changed and state == STATE_OFFLINE_CAMPUS:
+                notify("校园网掉线了", f"检测到未认证，正在自动重连…\n{net.source_ip}",
+                       cfg)
 
             if net.iface != last_iface:
                 log.info("当前出口网卡: %s (%s)", net.iface, net.source_ip)
@@ -1998,6 +2155,7 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
                         failures = 0
                         next_attempt = 0
                         clear_retry()
+                        notify("校园网已自动登录", f"网络已恢复\n{net.source_ip}", cfg)
                     else:
                         failures += 1
                         wait = failure_backoff(cfg, failures)
@@ -2006,6 +2164,9 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
                                     "updated": time.time()})
                         log.error("第 %s 次登录失败, %s 分钟后再试(成功即恢复常规检查)",
                                   failures, wait // 60)
+                        notify("校园网登录失败",
+                               f"第 {failures} 次失败，{wait // 60} 分钟后重试\n"
+                               f"详见 logs/campus_mac.log", cfg)
             else:
                 log.debug("状态不明, 本轮不做任何动作: %s", detail)
         except Exception as exc:                              # noqa: BLE001
@@ -2024,6 +2185,8 @@ def main() -> int:
     parser.add_argument("--set-cas-password", action="store_true",
                         help="单独保存【统一身份认证】密码(有线 CAS 用)")
     parser.add_argument("--check", action="store_true", help="只检测在线状态")
+    parser.add_argument("--status", action="store_true",
+                        help="简明状态总览(给普通人看的, 双击「查看状态」用的就是它)")
     parser.add_argument("--verify-password", action="store_true",
                         help="安全校验账号密码是否正确(不影响当前网络)")
     parser.add_argument("--diagnose", dest="diagnose", action="store_true",
@@ -2065,6 +2228,8 @@ def main() -> int:
             return cmd_make_ios_url(cfg, net)
         if args.check:
             return cmd_check(cfg, net)
+        if args.status:
+            return cmd_status(cfg, net)
         if args.verify_password:
             return cmd_verify_password(cfg, net)
         if args.watch:

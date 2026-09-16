@@ -30,6 +30,7 @@ SRC = HERE / "macos"
 
 FILES = [
     "AAA一键安装.command",
+    "查看状态.command",
     "卸载.command",
     "AAA使用说明.txt",
     "README.md",
@@ -38,11 +39,22 @@ FILES = [
     "install.sh",
     "uninstall.sh",
 ]
-EXECUTABLE = {"AAA一键安装.command", "卸载.command", "install.sh", "uninstall.sh", "campus_mac.py"}
+EXECUTABLE = {"AAA一键安装.command", "卸载.command", "查看状态.command", "install.sh", "uninstall.sh", "campus_mac.py"}
 
 
 def main() -> int:
-    version = sys.argv[1] if len(sys.argv) > 1 else "1.1"
+    # 版本号优先取命令行参数, 否则读 macos/config.json 里的 version(去掉开头的 v)
+    if len(sys.argv) > 1:
+        version = sys.argv[1]
+    else:
+        import json
+        try:
+            raw = json.loads((SRC / "config.json").read_text(encoding="utf-8"))
+            version = str(raw.get("version") or "1.1").lstrip("v")
+            # v1.2-macos -> 1.2 （包名里已经带 "macOS版"，不用重复）
+            version = version.replace("-macos", "").replace("-macOS", "")
+        except (OSError, ValueError):
+            version = "1.1"
     name = f"校园网自动登录_v{version}_macOS版"
     out = HERE / f"{name}.zip"
 

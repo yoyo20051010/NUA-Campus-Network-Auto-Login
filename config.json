@@ -4,24 +4,50 @@
   "cas_entry_url": "https://c.nua.edu.cn/cas/wifiLogin/innerLogin.jsp",
   "status_url": "https://c.nua.edu.cn/cas/wifiLogin/isLogin",
   "probe_url": "http://www.baidu.com/",
-  "campus_ip_ranges": [["1.1.1.1", "10.51.255.255"], ["10.52.0.0", "10.63.255.255"], ["10.128.0.1", "10.129.255.255"]],
+  "campus_ip_ranges": [
+    [
+      "1.1.1.1",
+      "10.51.255.255"
+    ],
+    [
+      "10.52.0.0",
+      "10.63.255.255"
+    ],
+    [
+      "10.128.0.1",
+      "10.129.255.255"
+    ]
+  ],
   "require_campus_ip": false,
   "portal_timeout": 5,
   "interval": 30,
   "headless": true,
   "login_timeout": 180,
-
   "_quiet_hours说明": "夜间限制时段：这段时间学校不允许学生账号认证，脚本不尝试登录、也不发任何网络请求，只在进入时记一行日志。days 用 0=周一 … 6=周日。默认周一~周五 00:00-06:00（覆盖'周日到周四晚上断网'的常见策略）。想每天都有这个时段就把 days 删掉；想关掉整个功能就把 enabled 改成 false。",
   "quiet_hours": {
     "enabled": true,
     "start": "00:00",
     "end": "06:00",
-    "days": [0, 1, 2, 3, 4]
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
   },
-
+  "_teacher账号说明": "教师账号前缀（默认 M）：这类账号所有时段都能认证，不受夜间限制时段影响。学生账号（学号 B 开头）只有周六日 24 小时可用，非周六日 00:00-06:00 无法认证 —— 正好对应 quiet_hours 的 days=[0,1,2,3,4]。",
+  "teacher_account_prefixes": [
+    "M"
+  ],
+  "quiet_hours_exempt_accounts": [],
   "_failure_backoff说明": "登录失败后的重试间隔（秒），依次取用；超出后一直用最后一个值。默认 2/5/15/30 分钟。",
-  "failure_backoff": [120, 300, 900, 1800],
-
+  "failure_backoff": [
+    120,
+    300,
+    900,
+    1800
+  ],
   "_wired_flow说明": "有线网段用哪套登录：drcom=直接走 Dr.COM 表单（默认，实测可行，能绕开统一认证的拼图滑块/人脸识别，也不需要 RSA）；cas=强制走统一身份认证；auto=同 drcom。两种都失败时会自动用另一套再试一次。",
   "wired_flow": "drcom"
 }
