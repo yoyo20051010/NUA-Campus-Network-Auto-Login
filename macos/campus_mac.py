@@ -59,6 +59,10 @@ HOSTS_CACHE = STATE_DIR / "hosts_cache.json"
 LOCK_FILE = STATE_DIR / "run.lock"
 RETRY_FILE = STATE_DIR / "retry.json"
 MODE_FILE = STATE_DIR / "mode.txt"
+# 上次登录成功的"服务类型"后缀(学校三家运营商账号后缀不同, 见 CARRIERS)
+# 按客户端网段分别记 —— 移动/电信/联通的校园网可能是不同网段,
+# 记错了也没关系, 会依次试其它后缀, 只是多一次请求。
+CARRIER_FILE = STATE_DIR / "carrier.json"
 LOCK_STALE_SECONDS = 900
 
 # Darwin: setsockopt(IPPROTO_IP, IP_BOUND_IF, ifindex) 把这条连接强制绑到物理网卡,
@@ -1405,6 +1409,61 @@ def login_cas(net: NetEnv, cfg: dict, account: str, password: str,
 # --------------------------------------------------------------------------- #
 # 登录: Dr.COM 原生表单 —— 无线网段(10.53.x / 10.54.x)
 # --------------------------------------------------------------------------- #
+
+# 学校的「服务类型」(运营商): 三家走同一个门户, 靠账号后缀区分。
+# 这份清单来自门户页里写死的 carrier 配置:
+#   {"id":"1","name":"校园用户","suffix":""},
+#   {"id":"2","name":"校园电信","suffix":"@dx"},
+#   {"id":"3","name":"校园联通","suffix":"@lt"}
+# 移动的同学用「校园用户」(不带后缀); @njxy 是备用写法。
+CARRIERS = [
+    ("校园用户(默认)", ""),
+    ("校园电信 @dx", "@dx"),
+    ("校园联通 @lt", "@lt"),
+    ("校园网后缀 @njxy", "@njxy"),
+]
+
+
+def _carrier_key(client_ip: str) -> str:
+    """按客户端 IP 的前两段做键，例如 10.53.96.247 -> '10.53'。"""
+    parts = (client_ip or "").split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else ""
+
+
+def _carrier_store() -> dict:
+    try:
+        data = json.loads(CARRIER_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_carrier(client_ip: str = ""):
+    """
+    该网段上次成功的服务类型后缀。
+    返回 None = 没记录过；返回 "" = 记录过"不带后缀"。
+    """
+    data = _carrier_store()
+    key = _carrier_key(client_ip)
+    if key and key in data:
+        return data[key]
+    if "" in data:
+        return data[""]
+    return None
+
+
+def save_carrier(suffix: str, client_ip: str = "") -> None:
+    data = _carrier_store()
+    data[_carrier_key(client_ip)] = suffix
+    data[""] = suffix          # 同时记一份全局的，换网段时当兜底
+    try:
+        CARRIER_FILE.parent.mkdir(exist_ok=True)
+        CARRIER_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+    except OSError:
+        pass
+
+
 def parse_portal_vars(html: str) -> dict:
     """抓门户页里 sv=0;... 那段变量, 里面写着认证接口与端口。"""
     out = {}
@@ -1449,13 +1508,23 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
     log.info("Dr.COM 登录接口: %s (账号字段 %s / 密码字段 %s)", url, user_field, pass_field)
 
     pinned = cfg.get("wifi_suffix", "")
+    cached_before = pinned if pinned else load_carrier(net.source_ip)
     if pinned:
-        forms = [(f"配置指定 {pinned}", f"{account}{pinned}")]
+        # 配置里写死了服务类型, 就只用它
+        forms = [(f"配置指定 {pinned}", f"{account}{pinned}", pinned)]
     else:
-        forms = [("校园用户(默认)", account),
-                 ("校园网后缀 @njxy", f"{account}@njxy"),
-                 ("校园电信 @dx", f"{account}@dx"),
-                 ("校园联通 @lt", f"{account}@lt")]
+        # 学校三家运营商走同一个门户, 但账号后缀不同:
+        #   校园用户(默认) = 不带后缀 / 校园电信 = @dx / 校园联通 = @lt
+        # 先试上次成功过的那个, 再依次试其它 —— 这样联通/电信的同学也能自动适配,
+        # 而且第二次起只用试一个, 不会平白多打几次请求。
+        cached = cached_before
+        forms = []
+        if cached is not None:
+            label = "上次成功(默认)" if cached == "" else f"上次成功({cached})"
+            forms.append((label, f"{account}{cached}", cached))
+        for label, suffix in CARRIERS:
+            if suffix != cached:
+                forms.append((label, f"{account}{suffix}", suffix))
 
     modern_url = (f"http://{host}:{port}/eportal/portal/login?callback=dr1003"
                   "&login_method=1&user_account=%2C0%2C" + urllib.parse.quote(account)
@@ -1463,7 +1532,7 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
                   + "&jsVersion=4.1.3&terminal_type=1&lang=zh-cn")
 
     if dry_run:
-        for name, user_value in forms:
+        for name, user_value, _suffix in forms:
             body = {user_field: user_value, pass_field: "***", "0MKKey": "123456",
                     "R1": "", "R2": "", "R3": "", "R6": "0", "para": "", "v6ip": "",
                     "terminal_type": "1", "lang": "zh-cn", "url": "drappall"}
@@ -1472,7 +1541,8 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
         log.info("[演练] 到此为止, 不发送密码")
         return False
 
-    for form_name, user_value in forms:
+    errors: list[str] = []
+    for form_name, user_value, form_suffix in forms:
         data = {
             user_field: user_value,
             pass_field: password,
@@ -1491,9 +1561,10 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
         log.info("  → HTTP %s: %s", resp.status, text)
         _dump("drcom-ACSetting", resp.text)
 
-        # 这些是"换服务类型/换接口都没用"的硬错误, 立刻停手, 不要反复撞
-        fatal = ("密码", "验证码", "在线数超出限制", "Limit Users",
-                 "Authentication fail", "绑定运营商")
+        # 这些是"换服务类型也没用"的硬错误 —— 立刻停手, 不要反复撞
+        # 注意: 「账号错误 / Authentication fail / 请先绑定运营商」都**不算**硬错误,
+        #      因为它们正是"服务类型选错了"的表现, 需要换下一个后缀再试。
+        fatal = ("密码", "验证码", "在线数超出限制", "Limit Users")
         hit = next((w for w in fatal if w in resp.text), "")
         if hit:
             if hit == "验证码":
@@ -1508,8 +1579,13 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
 
         if _wait_online(net, cfg, 8):
             log.info("Dr.COM 登录成功(服务类型: %s)", form_name)
+            if cached_before != form_suffix:
+                save_carrier(form_suffix, net.source_ip)
+                log.info("已记住该账号的服务类型(%s)，下次直接用它",
+                         "默认不带后缀" if form_suffix == "" else form_suffix)
             return True
         log.info("  服务类型 %s 未成功, 换下一个", form_name)
+        errors.append(text)
 
     # 后备: 新版 JSONP 接口(本校实测通常不可用, 但别的 AC 版本可能只有它)
     log.info("老接口都未成功, 试后备的新版 JSONP 接口")
@@ -1518,7 +1594,10 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
     if _wait_online(net, cfg, 10):
         return True
 
-    log.error("Dr.COM 门户登录失败")
+    log.error("Dr.COM 门户登录失败(试过 %s 种服务类型)", len(forms))
+    if errors and all(("Authentication fail" in e or "账号错误" in e) for e in errors):
+        log.error("所有服务类型都被拒 —— 通常是账号密码不对; "
+                  "也可能是这家运营商还没绑定账号(提示里会写「请先绑定运营商账号」)")
     return False
 
 
