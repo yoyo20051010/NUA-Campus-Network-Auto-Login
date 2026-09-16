@@ -1,0 +1,49 @@
+name: macOS CI
+
+# 只在 macOS 相关文件变动时运行 —— 不影响 Windows / OpenWrt 的改动
+on:
+  push:
+    paths:
+      - 'macos/**'
+      - '.github/workflows/macos-ci.yml'
+  pull_request:
+    paths:
+      - 'macos/**'
+      - '.github/workflows/macos-ci.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 语法检查（py_compile）
+        run: python -m py_compile macos/campus_mac.py macos/make_ios_shortcut.py
+
+      - name: 模块能正常加载
+        run: >-
+          python -c "import importlib.util as u;
+          s=u.spec_from_file_location('m','macos/campus_mac.py');
+          m=u.module_from_spec(s); s.loader.exec_module(m); print('ok')"
+
+      - name: 配置模板是合法 JSON
+        run: python -c "import json; json.load(open('macos/config.json', encoding='utf-8'))"
+
+      - name: 命令行入口可用
+        run: python macos/campus_mac.py --help > /dev/null
+
+      - name: shell 脚本语法
+        run: |
+          sh -n macos/install.sh
+          sh -n macos/uninstall.sh
+
+      - name: 确认没有提交凭据或运行产物
+        run: |
+          if git ls-files | grep -E 'macos/(secret\.json|logs/|state/)|\.shortcut$'; then
+            echo "::error::检测到不该提交的文件（凭据/日志/产物）"; exit 1
+          fi
+          echo "ok"
