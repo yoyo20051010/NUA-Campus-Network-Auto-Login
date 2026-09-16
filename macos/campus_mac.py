@@ -1123,13 +1123,59 @@ def keychain_set(service: str, account: str, password=None) -> bool:
     return True
 
 
-def load_credentials(cfg: dict, kind: str = "drcom"):
+def account_for(cfg: dict, client_ip: str = "") -> str:
+    """
+    按当前网段挑账号 —— 不同运营商(Wi-Fi)可能是不同的账号密码。
+
+    config.json 里可以这么写:
+        "account": "B241007020",                    # 默认账号(兜底)
+        "accounts": {"10.53": "B241007020",         # 移动网段
+                     "10.54": "D12345678"}          # 电信网段
+    键是客户端 IP 的前两段(10.53.96.247 -> "10.53")。
+    """
+    accounts = cfg.get("accounts") or {}
+    key = _carrier_key(client_ip)
+    entry = accounts.get(key)
+    if isinstance(entry, str) and entry.strip():
+        return entry.strip()
+    if isinstance(entry, dict) and str(entry.get("account", "")).strip():
+        return str(entry["account"]).strip()
+    return (cfg.get("account") or "").strip()
+
+
+def remember_account(account: str, client_ip: str = "") -> None:
+    """把"这个网段该用哪个账号"记进 config.json。"""
+    cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cfg = {}
+    accounts = cfg.get("accounts")
+    if not isinstance(accounts, dict):
+        accounts = {}
+    key = _carrier_key(client_ip)
+    if key:
+        accounts[key] = account
+        cfg["accounts"] = accounts
+        cfg["_accounts说明"] = ("按网段记的账号: 键是客户端 IP 前两段。"
+                                "不同运营商(Wi-Fi)用不同账号时在这里配。")
+    cfg["account"] = account
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+    except OSError as exc:
+        log.warning("写入 config.json 失败: %s", exc)
+
+
+def load_credentials(cfg: dict, kind: str = "drcom", client_ip: str = ""):
     """
     kind="drcom" -> 上网密码(无线 Dr.COM 门户用)
     kind="cas"   -> 统一身份认证密码(有线走 CAS 用, 可能和上网密码不同)
+    client_ip    -> 当前网段, 用来挑对应的账号(多运营商场景)
     找不到时回退到另一个, 再不行用 secret.json。
     """
-    account = (cfg.get("account") or "").strip()
+    account = account_for(cfg, client_ip)
     service = cfg.get("keychain_service", "campus-net-login")
     cas_service = cfg.get("keychain_cas_service", "campus-net-cas")
     password = None
@@ -1186,8 +1232,27 @@ def save_account_to_config(account: str) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def cmd_set_password(cfg: dict) -> None:
-    account = (cfg.get("account") or "").strip() or input("校园网账号(学号): ").strip()
+def cmd_set_password(cfg: dict, net: "NetEnv | None" = None) -> None:
+    """
+    保存账号密码。
+    会记住"当前这个网段用哪个账号" —— 不同运营商(移动/电信/联通)的
+    Wi-Fi 账号密码不同时, 各连一次、各存一次即可。
+    """
+    client_ip = ""
+    if net is not None:
+        try:
+            net.select()
+            client_ip = net.source_ip or ""
+        except Exception:                                     # noqa: BLE001
+            client_ip = ""
+    current = account_for(cfg, client_ip)
+
+    tip = "校园网账号(学号)"
+    if client_ip:
+        tip += f"【当前网段 {_carrier_key(client_ip)}.x】"
+    if current:
+        tip += f"，直接回车沿用 {current}"
+    account = input(f"{tip}: ").strip() or current
     if not account:
         raise SystemExit("账号不能为空")
     service = cfg.get("keychain_service", "campus-net-login")
@@ -1198,8 +1263,9 @@ def cmd_set_password(cfg: dict) -> None:
         password = getpass.getpass("密码(输入时不显示): ")
         ok = keychain_set(service, account, password)
     if ok:
-        save_account_to_config(account)
-        print(f"已保存: 账号 {account} 写入 config.json, 密码写入钥匙串条目 “{service}”")
+        remember_account(account, client_ip)
+        where = f"（已记住 {_carrier_key(client_ip)}.x 网段用这个账号）" if client_ip else ""
+        print(f"已保存: 账号 {account} {where}, 密码写入钥匙串条目 “{service}”")
     else:
         password = getpass.getpass("钥匙串写入失败, 改为保存明文到 secret.json: ")
         SECRET_FILE.write_text(json.dumps({"account": account, "password": password}),
@@ -1208,7 +1274,7 @@ def cmd_set_password(cfg: dict) -> None:
             SECRET_FILE.chmod(0o600)
         except OSError:
             pass
-        save_account_to_config(account)
+        remember_account(account, client_ip)
         print(f"已保存到 {SECRET_FILE}(权限 600)")
 
 
@@ -1648,7 +1714,8 @@ def do_login(cfg: dict, net: NetEnv, dry_run: bool = False, force: bool = False)
             log.info("有线网段: 按配置改用 Dr.COM 表单登录(绕过统一认证的人脸识别)")
             flow = "drcom"
         try:
-            account, password = load_credentials(cfg, "cas" if flow == "cas" else "drcom")
+            account, password = load_credentials(cfg, "cas" if flow == "cas" else "drcom",
+                                                 net.source_ip)
         except SystemExit:
             if not dry_run:
                 raise
@@ -1766,7 +1833,7 @@ def cmd_verify_password(cfg: dict, net: NetEnv) -> int:
     返回"用户名或密码错误"= 密码不对。
     """
     net.select()
-    account, password = load_credentials(cfg, "cas")
+    account, password = load_credentials(cfg, "cas", net.source_ip)
     sess = net.session
 
     service_q = urllib.parse.quote(cfg["service"], safe="")
@@ -1936,7 +2003,7 @@ def main() -> int:
     net = NetEnv(cfg)
     try:
         if args.set_password:
-            cmd_set_password(cfg)
+            cmd_set_password(cfg, net)
             return 0
         if args.set_cas_password:
             cmd_set_cas_password(cfg)

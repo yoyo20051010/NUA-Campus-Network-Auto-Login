@@ -105,7 +105,7 @@ def build_shortcut(url: str, body, headers) -> dict:
 
 def main() -> int:
     cfg = cm.load_config()
-    account, password = cm.load_credentials(cfg, "drcom")
+    account, password = cm.load_credentials(cfg, "drcom", "")
     url, body, headers = build_request(cfg, account, password)
 
     UNSIGNED.parent.mkdir(exist_ok=True)

@@ -8,6 +8,8 @@
   "captcha_url": "https://c.nua.edu.cn/captchValid/checkCaptchImg",
   "probe_url": "http://connect.rom.miui.com/generate_204",
   "account": "",
+  "_accounts说明": "按网段记的账号: 键是客户端 IP 前两段(如 10.53)。移动/电信/联通的 Wi-Fi 账号不同时, 各连一次各存一次即可, 用 --set-password 自动写入。",
+  "accounts": {},
   "keychain_service": "campus-net-login",
   "interface": "",
   "cas_ip_ranges": [
