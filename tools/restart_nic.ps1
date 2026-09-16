@@ -133,6 +133,17 @@ Write-Host "型号     : $($nic.InterfaceDescription)"
 Write-Host "接口号   : $($nic.ifIndex)   当前状态: $($nic.Status)"
 Write-Host "禁用时长 : $Seconds 秒 ($([math]::Round($Seconds / 60, 1)) 分钟)"
 Write-Host "登录引擎 : $(if ($Engine -eq 'http') { '纯 HTTP（不开浏览器）' } else { '浏览器' })"
+
+# 无线网卡如果连着，禁用有线之后它会接管流量，就测不到"有线那条路"了
+$wifiUp = Get-NetAdapter | Where-Object {
+    $_.PhysicalMediaType -eq 'Native 802.11' -and $_.Status -eq 'Up'
+}
+if ($wifiUp) {
+    Write-Host ""
+    Write-Host "⚠ 注意：无线网卡 $($wifiUp.Name) 当前是连接状态。" -ForegroundColor Yellow
+    Write-Host "  禁用有线期间流量会走 WiFi，测到的就不是有线那条路了。" -ForegroundColor Yellow
+    Write-Host "  想测有线请先断开 WiFi（或忽略这条，两条路用的是同一套 Dr.COM 逻辑）。" -ForegroundColor Yellow
+}
 Write-Host ""
 
 if ($DryRun) {
