@@ -1862,7 +1862,7 @@ def release_lock() -> None:
 # --------------------------------------------------------------------------- #
 VERSION = "1.1"
 DEFAULT_UPDATE_API = ("https://api.github.com/repos/yoyo20051010/"
-                      "NUA-Campus-Network-Auto-Login/releases?per_page=1")
+                      "NUA-Campus-Network-Auto-Login/releases?per_page=10")
 UPDATE_CHECK_FILE = STATE_DIR / "update_check.json"
 
 
@@ -1882,6 +1882,14 @@ def notify(title: str, message: str, cfg: dict | None = None) -> None:
             capture_output=True, timeout=8)
     except Exception:                                         # noqa: BLE001
         pass
+
+
+def _version_tuple(tag: str):
+    """把 v1.3-macos 这样的 tag 变成可比较的 (1, 3)。取不到数字就返回 None。"""
+    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", tag or "")
+    if not m:
+        return None
+    return tuple(int(x or 0) for x in m.groups())
 
 
 def check_update(cfg: dict, force: bool = False) -> str:
@@ -1905,12 +1913,14 @@ def check_update(cfg: dict, force: bool = False) -> str:
         pass
 
     mine = str(cfg.get("version") or VERSION).strip()
+    mine_ver = _version_tuple(mine)
 
     # 同时查两个源: 配置里那个 + 内置的默认源。
     # 原因: 早期版本把这个地址写进了 config.json(指向某个 fork), 后来发版挪到了上游;
     # 两个都查, 老安装也能收到新版本提示。
     urls = [u for u in (cfg.get("update_api"), DEFAULT_UPDATE_API) if u]
     seen = set()
+    best = None            # (版本元组, tag, 链接)
     for url in urls:
         if url in seen:
             continue
@@ -1925,12 +1935,24 @@ def check_update(cfg: dict, force: bool = False) -> str:
             continue
         # /releases 返回列表; /releases/latest 返回单个对象。两种都兼容。
         if isinstance(data, list):
-            data = data[0] if data else {}
-        if not isinstance(data, dict):
-            continue
-        tag = str(data.get("tag_name") or "").strip()
-        if tag and tag != mine:
-            return f"有新版本 {tag}（当前 {mine}）: {data.get('html_url') or url}"
+            releases = data
+        else:
+            releases = [data] if data else []
+        for item in releases:
+            if not isinstance(item, dict):
+                continue
+            tag = str(item.get("tag_name") or "").strip()
+            ver = _version_tuple(tag)
+            if not tag or ver is None:
+                continue
+            if best is None or ver > best[0]:
+                best = (ver, tag, item.get("html_url") or url)
+
+    # 只有"版本号确实更大"才算新版本。
+    # 不能只比 tag 是否不同 —— 上游的 v1.2(Windows) 和本机的 v1.3-macos 是不同的号,
+    # 但 v1.2 并不是"更新"。数字一样就当同一个版本(比如 v1.3 与 v1.3-macos)。
+    if best and mine_ver and best[0] > mine_ver:
+        return f"有新版本 {best[1]}（当前 {mine}）: {best[2]}"
     return ""
 
 
