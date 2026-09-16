@@ -1300,6 +1300,7 @@ def cmd_set_password(cfg: dict, net: "NetEnv | None" = None) -> None:
         ok = keychain_set(service, account, password)
     if ok:
         remember_account(account, client_ip)
+        clear_retry()          # 存了新账号就把失败退避清掉, 让看门狗立刻重新试
         where = f"（已记住 {_carrier_key(client_ip)}.x 网段用这个账号）" if client_ip else ""
         print(f"已保存: 账号 {account} {where}, 密码写入钥匙串条目 “{service}”")
     else:
