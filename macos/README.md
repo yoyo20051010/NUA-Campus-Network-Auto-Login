@@ -117,9 +117,9 @@ python3 campus_mac.py --set-password     # 输电信的账号密码
 也可以直接写进 `config.json`：
 
 ```json
-"account": "B241007020",
+"account": "B240000000",
 "accounts": {
-    "10.53": "B241007020",
+    "10.53": "B240000000",
     "10.54": "D12345678"
 }
 ```
