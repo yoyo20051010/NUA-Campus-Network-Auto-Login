@@ -15,7 +15,7 @@
   "_version说明": "本机版本号, 与 Release 的 tag 保持一致; 用于检查更新",
   "notify": true,
   "_notify说明": "登录成功/失败/掉线时弹 macOS 系统通知; 不想被打扰就改成 false",
-  "update_api": "https://api.github.com/repos/zacharyli001/NUA-Campus-Network-Auto-Login/releases?per_page=1",
+  "update_api": "https://api.github.com/repos/yoyo20051010/NUA-Campus-Network-Auto-Login/releases?per_page=1",
   "_update_api说明": "检查更新用的接口(最多 12 小时查一次, 失败静默)。用 /releases 列表而不是 /latest, 因为预发布版本 /latest 查不到",
   "interface": "",
   "cas_ip_ranges": [

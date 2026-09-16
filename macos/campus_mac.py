@@ -1859,7 +1859,7 @@ def release_lock() -> None:
 # 版本 / 通知 / 更新检查
 # --------------------------------------------------------------------------- #
 VERSION = "1.1"
-DEFAULT_UPDATE_API = ("https://api.github.com/repos/zacharyli001/"
+DEFAULT_UPDATE_API = ("https://api.github.com/repos/yoyo20051010/"
                       "NUA-Campus-Network-Auto-Login/releases?per_page=1")
 UPDATE_CHECK_FILE = STATE_DIR / "update_check.json"
 
@@ -1902,25 +1902,34 @@ def check_update(cfg: dict, force: bool = False) -> str:
     except OSError:
         pass
 
-    url = cfg.get("update_api") or DEFAULT_UPDATE_API
-    code, out = sh(["/usr/bin/curl", "-sL", "-m", "10",
-                    "-H", "Accept: application/vnd.github+json", url], timeout=15)
-    if code != 0 or not out.strip():
-        return ""
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return ""
-    # /releases 返回的是列表; /releases/latest 返回单个对象。两种都兼容。
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    if not isinstance(data, dict):
-        return ""
-    tag = str(data.get("tag_name") or "").strip()
     mine = str(cfg.get("version") or VERSION).strip()
-    if not tag or tag == mine:
-        return ""
-    return f"有新版本 {tag}（当前 {mine}）: {data.get('html_url') or url}"
+
+    # 同时查两个源: 配置里那个 + 内置的默认源。
+    # 原因: 早期版本把这个地址写进了 config.json(指向某个 fork), 后来发版挪到了上游;
+    # 两个都查, 老安装也能收到新版本提示。
+    urls = [u for u in (cfg.get("update_api"), DEFAULT_UPDATE_API) if u]
+    seen = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        code, out = sh(["/usr/bin/curl", "-sL", "-m", "10",
+                        "-H", "Accept: application/vnd.github+json", url], timeout=15)
+        if code != 0 or not out.strip():
+            continue
+        try:
+            data = json.loads(out)
+        except ValueError:
+            continue
+        # /releases 返回列表; /releases/latest 返回单个对象。两种都兼容。
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            continue
+        tag = str(data.get("tag_name") or "").strip()
+        if tag and tag != mine:
+            return f"有新版本 {tag}（当前 {mine}）: {data.get('html_url') or url}"
+    return ""
 
 
 def cmd_status(cfg: dict, net: NetEnv) -> int:
