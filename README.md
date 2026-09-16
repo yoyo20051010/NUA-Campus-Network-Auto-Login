@@ -4,7 +4,7 @@
 
 > Automatic campus network login for Nanjing University of the Arts (NUA).
 > Logs in on boot, reconnects within a minute after a drop, and never touches
-> other networks. Works on Windows; an OpenWrt router build is included too.
+> other networks. Works on Windows and macOS; an OpenWrt router build is included too.
 
 ---
 
@@ -12,8 +12,10 @@
 
 - **开机自动登录**：登录 Windows 20 秒后检查一次，之后每分钟检查一次
 - **掉线自动重连**：断网后 1 分钟内自动恢复
-- **两套认证流程都支持**：有线（统一身份认证 + 拼图滑块）和校园无线（Dr.COM 门户）
-- **三种运行方式**：纯 HTTP（默认，实测 < 1 秒）、浏览器、路由器（OpenWrt）
+- **两套认证流程都支持**：有线（统一身份认证）和校园无线（Dr.COM 门户）
+  ⚠️ 实测提醒：有线提交后的「安全验证」**不一定是拼图滑块**——有账号会遇到**人脸识别**
+  （`loginType=4`），那个页面里两套 DOM 都有，很容易看错。详见 [docs/macOS适配与实测记录.md](docs/macOS适配与实测记录.md)
+- **多平台**：Windows（纯 HTTP / 浏览器）、路由器（OpenWrt）、**macOS（原生，已实测）**
 - **不乱试密码**：只有在「校园网认证页能打开」且「当前确实未认证」时才动作，
   连着家里 WiFi、手机热点或 VPN 时直接跳过
 - **夜间免打扰**：夜间限制时段（默认周一~周五 00:00–06:00）完全不尝试，也不发请求
@@ -53,6 +55,21 @@ python campus_login.py --login --show  # 带窗口，能看见全过程
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1 -Engine http
 ```
+
+
+### 方式三：macOS（原生化，开机自动联网）
+
+macOS 版是原生实现（纯 Python 标准库，不需要 pip、不需要浏览器），
+并针对 mac 做了几处专门处理：绑定物理网卡绕过 TUN 模式 VPN、自带 DNS 绕过 fake-ip、
+密码存钥匙串、launchd 开机自启、夜间静默、掉线自动重连。
+
+```bash
+cd macos
+sh install.sh          # 存账号密码到钥匙串 + 安装开机自启 + 自动体检
+```
+
+详见 [macos/README.md](macos/README.md)；实测记录与几个跨平台都适用的坑见
+[docs/macOS适配与实测记录.md](docs/macOS适配与实测记录.md)。
 
 ---
 

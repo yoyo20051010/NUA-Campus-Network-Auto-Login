@@ -1,0 +1,62 @@
+{
+  "_说明": "macOS 版配置。account 由 install.sh 自动填写; 密码在钥匙串里, 不在这里。",
+  "portal_url": "http://10.255.255.2/",
+  "portal_api_port": 801,
+  "cas_login_url": "https://c.nua.edu.cn/cas/login",
+  "service": "https://c.nua.edu.cn/cas/wifiLogin/innerLogin.jsp",
+  "status_url": "https://c.nua.edu.cn/cas/wifiLogin/isLogin",
+  "captcha_url": "https://c.nua.edu.cn/captchValid/checkCaptchImg",
+  "probe_url": "http://connect.rom.miui.com/generate_204",
+  "account": "",
+  "_accounts说明": "按网段记的账号: 键是客户端 IP 前两段(如 10.53)。移动/电信/联通的 Wi-Fi 账号不同时, 各连一次各存一次即可, 用 --set-password 自动写入。",
+  "accounts": {},
+  "keychain_service": "campus-net-login",
+  "interface": "",
+  "cas_ip_ranges": [
+    [
+      "1.1.1.1",
+      "10.51.255.255"
+    ],
+    [
+      "10.128.0.1",
+      "10.129.255.255"
+    ]
+  ],
+  "interval": 30,
+  "login_timeout": 90,
+  "http_timeout": 8,
+  "dns_timeout": 3,
+  "dns_servers": [],
+  "fallback_dns": [
+    "223.5.5.5",
+    "114.114.114.114"
+  ],
+  "pinned_hosts": {},
+  "drcom_extra_query": {},
+  "interval_battery": 120,
+  "interval_offcampus": 300,
+  "drcom_legacy_fallback": false,
+  "keychain_cas_service": "campus-net-cas",
+  "quiet_hours": {
+    "enabled": true,
+    "start": "00:00",
+    "end": "06:00",
+    "days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "_quiet_hours说明": "夜间静默: 学校这段时间不让认证, 完全不发请求。days: 0=周一…6=周日; 想每天都静默就删掉 days; 关掉就 enabled=false",
+  "failure_backoff": [
+    120,
+    300,
+    900,
+    1800
+  ],
+  "_failure_backoff说明": "登录失败后的重试间隔(秒), 依次取用; 成功一次立刻恢复常规检查",
+  "wired_flow": "drcom",
+  "_wired_flow说明": "有线默认也走 Dr.COM 表单: 实测可行, 且能绕过学校统一认证的『人脸识别』(那条路需要真人刷脸, 自动化不了)。想强制走统一认证改成 cas"
+}
