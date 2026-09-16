@@ -502,16 +502,36 @@ def login(sess: Session, cfg: dict, account: str, password: str) -> bool:
         return False
 
     ip = client_ip_from_portal(portal_html)
-    if needs_cas(ip):
-        log.info("门户判定为有线网段（客户端 %s）→ 走统一身份认证", ip)
+    wired = needs_cas(ip)
+    wired_flow = str(cfg.get("wired_flow") or "drcom").lower()
+
+    if wired and wired_flow == "cas":
+        log.info("有线网段（客户端 %s）→ 按配置走统一身份认证", ip)
         return cas_login(sess, cfg, account, password)
 
-    log.info("门户判定为无线网段（客户端 %s）→ 走 Dr.COM 门户登录", ip)
-    return drcom_login(sess, cfg, portal_html, account, password)
+    if wired:
+        # 实测（2026-09-16）：Dr.COM 的登录接口并不拒绝有线客户端。
+        # 直接走表单可以绕开统一认证必须做的滑块 / 人脸验证，也不需要 RSA 加密。
+        log.info("有线网段（客户端 %s）→ 优先走 Dr.COM 表单（可绕开统一认证的验证环节）", ip)
+    else:
+        log.info("无线网段（客户端 %s）→ 走 Dr.COM 门户登录", ip)
+
+    result = drcom_login(sess, cfg, portal_html, account, password)
+    if result == "ok":
+        return True
+    if result == "fatal":
+        # 账号级问题（密码错 / 在线数超限 / 要验证码）：换统一认证也一样没用，
+        # 再打请求只会增加账号被锁的风险，所以直接停手。
+        log.error("Dr.COM 登录遇到需要人工处理的提示，本次不再尝试其它登录方式")
+        return False
+    if wired and wired_flow != "cas":
+        log.info("Dr.COM 方式没有成功，改用统一身份认证再试一次")
+        return cas_login(sess, cfg, account, password)
+    return False
 
 
 def drcom_login(sess: Session, cfg: dict, portal_html: str,
-                account: str, password: str) -> bool:
+                account: str, password: str) -> str:
     """
     校园无线网段的登录：门户自己的表单，字段是 DDDDD / upass，
     一般没有拼图滑块（配置里 password_cut=0、en_md5=0，密码按明文提交）。
@@ -587,28 +607,37 @@ def drcom_login(sess: Session, cfg: dict, portal_html: str,
 
             if "验证码" in body:
                 log.error("门户要求图形验证码，纯 HTTP 模式无法自动识别（可改用浏览器模式）")
-                return False
+                return "fatal"
 
             # 提交后给服务器一点时间放行
             deadline = time.time() + 8
             while time.time() < deadline:
                 if is_online(sess, cfg, quiet=True):
                     log.info("登录成功，网络已恢复（服务类型：%s）", form_name)
-                    return True
+                    return "ok"
                 time.sleep(2)
 
             last_error = text
             if endpoint_name == "ACSetting":
                 tried_acsetting = True
-            # 密码错误就没必要再换接口/后缀了，避免触发失败锁定
-            if "密码" in body and "运营商" not in body:
-                log.error("服务器提示密码错误，停止重试以免触发锁定")
-                return False
+
+            # 这几类错误换接口、换服务类型都没用，而且继续试可能把账号撞锁，
+            # 所以立刻停手，并把 AC 的原话写进日志让用户知道到底怎么了。
+            # 注意："账号错误" / "Authentication fail" 不算致命 —— 那往往只是
+            # 服务类型(后缀)选错了，应该继续试下一个。
+            fatal_words = ("密码", "验证码", "在线数超出限制", "Limit Users", "已在线")
+            hit = next((w for w in fatal_words if w in body), "")
+            if hit:
+                log.error("服务器返回需要人工处理的提示 [%s]：%s", hit, text)
+                if hit == "已在线":
+                    log.error("  说明该账号已经有一个会话在线（学校限制并发设备数）。")
+                    log.error("  旧会话在服务端会残留 7~10 分钟才释放，这期间新设备登录会被拒。")
+                return "fatal"
 
         log.info("  接口 %s 未成功，换下一个接口", endpoint_name)
 
     log.error("Dr.COM 门户登录失败，最后一次返回: %s", last_error)
-    return False
+    return "failed"
 
 
 def cas_login(sess: Session, cfg: dict, account: str, password: str) -> bool:

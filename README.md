@@ -4,7 +4,7 @@
 
 > Automatic campus network login for Nanjing University of the Arts (NUA).
 > Logs in on boot, reconnects within a minute after a drop, and never touches
-> other networks. Works on Windows and macOS; an OpenWrt router build is included too.
+> other networks. Works on Windows; an OpenWrt router build is included too.
 
 ---
 
@@ -12,10 +12,12 @@
 
 - **开机自动登录**：登录 Windows 20 秒后检查一次，之后每分钟检查一次
 - **掉线自动重连**：断网后 1 分钟内自动恢复
-- **两套认证流程都支持**：有线（统一身份认证）和校园无线（Dr.COM 门户）
-  ⚠️ 实测提醒：有线提交后的「安全验证」**不一定是拼图滑块**——有账号会遇到**人脸识别**
-  （`loginType=4`），那个页面里两套 DOM 都有，很容易看错。详见 [docs/macOS适配与实测记录.md](docs/macOS适配与实测记录.md)
-- **多平台**：Windows（纯 HTTP / 浏览器）、路由器（OpenWrt）、**macOS（原生，已实测）**
+- **两套认证流程都支持**：Dr.COM 门户表单（有线/无线通用）和统一身份认证（CAS）
+  - ⚠️ 有线走 CAS 时，提交后的「安全验证」**不一定是拼图滑块**——部分账号会遇到**人脸识别**
+    （`loginType=4`，需要真人对着摄像头），自动化无法完成。详见 [docs/技术细节.md](docs/技术细节.md)
+- **默认走 Dr.COM 表单**：实测（2026-09-16）有线网段同样可用，可绕开 CAS 的滑块/人脸验证，
+  也不需要 RSA 加密和浏览器。可用 `config.json` 的 `wired_flow` 改回 `cas`
+- **多平台**：Windows（纯 HTTP / 浏览器）、路由器（OpenWrt）、**macOS（原生）**
 - **不乱试密码**：只有在「校园网认证页能打开」且「当前确实未认证」时才动作，
   连着家里 WiFi、手机热点或 VPN 时直接跳过
 - **夜间免打扰**：夜间限制时段（默认周一~周五 00:00–06:00）完全不尝试，也不发请求
@@ -56,40 +58,40 @@ python campus_login.py --login --show  # 带窗口，能看见全过程
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1 -Engine http
 ```
 
+### 方式三：macOS（原生，开机自动联网）
 
-### 方式三：macOS（原生化，开机自动联网）
-
-macOS 版是原生实现（纯 Python 标准库，不需要 pip、不需要浏览器），
-并针对 mac 做了几处专门处理：绑定物理网卡绕过 TUN 模式 VPN、自带 DNS 绕过 fake-ip、
-密码存钥匙串、launchd 开机自启、夜间静默、掉线自动重连。
+macOS 版是原生实现（纯 Python 标准库，不需要 pip、不需要浏览器），针对 mac 做了专门处理：
+绑定物理网卡绕过 TUN 模式 VPN、自带迷你 DNS 绕过 Clash 的 fake-ip、密码存**钥匙串**、
+launchd 开机自启、夜间静默、掉线自动重连。
 
 ```bash
 cd macos
 sh install.sh          # 存账号密码到钥匙串 + 安装开机自启 + 自动体检
 ```
 
-详见 [macos/README.md](macos/README.md)；实测记录与几个跨平台都适用的坑见
+详见 [macos/README.md](macos/README.md)，实测记录见
 [docs/macOS适配与实测记录.md](docs/macOS适配与实测记录.md)。
 
 ---
 
 ## 它是怎么工作的
 
-学校的认证链路有两层：Dr.COM 门户 + 统一身份认证。工具会根据客户端所处网段自动选择流程：
+学校的认证链路有两层：Dr.COM 门户 + 统一身份认证（CAS）。默认**两段都优先走 Dr.COM 表单**
+（`config.json` 的 `wired_flow` 可改），CAS 作为后备：
 
 ```
 连接校园网
    │
-   ├─ 有线（IP 10.12.x）── 门户 JS 跳转 ─→ 统一身份认证
-   │                                      账号密码 → 提交
-   │                                      → 服务器返回「请完成安全验证」页
-   │                                      → 拖动拼图滑块到位
-   │                                      → POST /cas/captchValid/checkCaptchImg
-   │                                      → 提交表单，网络放行
+   ├─ 默认（有线/无线通用）── Dr.COM 门户表单
+   │                          POST /eportal/?c=ACSetting&a=Login&ver=1.0
+   │                          字段 DDDDD / upass → 成功返回 Dr.COMWebLoginID_3.htm
+   │                          （服务类型默认「校园用户」，另有 @dx / @lt）
    │
-   └─ 校园无线（IP 10.54.x）── 门户自己的登录页
-                              POST /eportal/?c=ACSetting&a=Login&ver=1.0
-                              字段 DDDDD / upass，成功后返回 Dr.COMWebLoginID_3.htm
+   └─ 后备：统一身份认证（CAS）
+                              门户按客户端 IP 把有线引导到这里
+                              账号密码 → 提交 → 服务器返回「请完成安全验证」
+                              → 拼图滑块（拖到位后 POST /cas/captchValid/checkCaptchImg）
+                              ⚠️ 部分账号这里是**人脸识别**，自动化无法完成
 ```
 
 几个实现上的关键点（踩过的坑，详见 [docs/技术细节.md](docs/技术细节.md)）：

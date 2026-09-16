@@ -41,7 +41,7 @@ $files = @(
     'campus_http.py', 'campus_login.py', 'config.json', 'requirements.txt',
     'AAA使用说明.txt', '常见问题.txt'
 )
-$dirs = @('docs', 'openwrt', 'tools')
+$dirs = @('docs', 'openwrt', 'tools', 'macos', '.github')
 
 foreach ($f in $files) {
     $src = Join-Path $AppDir $f

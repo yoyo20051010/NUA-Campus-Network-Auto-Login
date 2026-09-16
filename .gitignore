@@ -1,14 +1,10 @@
 # ---- 凭据（千万不要提交）----
 secret.json
 secret.bin
-macos/secret.json
 
 # ---- 运行产物 ----
 logs/
 screenshots/
-macos/logs/
-macos/state/
-macos/*.shortcut
 browser-profile/
 __pycache__/
 *.py[cod]
