@@ -1168,6 +1168,42 @@ def remember_account(account: str, client_ip: str = "") -> None:
         log.warning("写入 config.json 失败: %s", exc)
 
 
+def credential_candidates(cfg: dict, client_ip: str = "") -> list:
+    """
+    返回 [(说明, 账号, 密码), ...] —— 按"最可能成功"排序。
+    主账号(按网段匹配) 排前面, 其它在 config 里出现过的账号排后面。
+    这样换到另一张校园网(账号不同)时, 不用先手动配置也能自动试对。
+    """
+    service = cfg.get("keychain_service", "campus-net-login")
+    cas_service = cfg.get("keychain_cas_service", "campus-net-cas")
+
+    def get_pw(acc: str):
+        return keychain_get(service, acc) or keychain_get(cas_service, acc)
+
+    out = []
+    seen = set()
+
+    def add(acc: str, label: str) -> None:
+        acc = (acc or "").strip()
+        if not acc or acc in seen:
+            return
+        seen.add(acc)
+        pw = get_pw(acc)
+        if pw:
+            out.append((f"{label} {acc}", acc, pw))
+
+    add(account_for(cfg, client_ip), "主账号")
+    accounts = cfg.get("accounts") or {}
+    for value in accounts.values():
+        if isinstance(value, str):
+            add(value, "备用账号")
+        elif isinstance(value, dict):
+            add(str(value.get("account", "")), "备用账号")
+    add(cfg.get("account", ""), "备用账号")
+    return out
+
+
+
 def load_credentials(cfg: dict, kind: str = "drcom", client_ip: str = ""):
     """
     kind="drcom" -> 上网密码(无线 Dr.COM 门户用)
@@ -1543,17 +1579,18 @@ def parse_portal_vars(html: str) -> dict:
     return out
 
 
-def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
-                dry_run: bool = False) -> bool:
+def login_drcom(net: NetEnv, cfg: dict, creds: list, dry_run: bool = False) -> bool:
     """
     校园无线网段的登录: 门户自己的表单, 字段是 DDDDD / upass。
+
+    creds: [(说明, 账号, 密码), ...] —— 会按顺序试(主账号在前)。
+    每个账号会配各种"服务类型"后缀一起试:
 
     2026-09-15 依据 v1.1 实测结论修正了三个关键点:
       1. 登录路径必须带 ver=1.0, 否则 AC 返回的是后台管理页面(不是登录接口);
       2. 必须带 AJAX 头(X-Requested-With), 否则同样会拿到后台页面;
       3. 新版 /eportal/portal/login 在本校会返回"无法获取用户认证账号",
          只能作为后备; 主力是 /eportal/?c=ACSetting&a=Login&ver=1.0。
-    服务类型默认"校园用户"(账号不带后缀), 另有 @njxy / @dx / @lt。
     """
     sess = net.session
     reached, detail, html = portal_probe(sess, cfg)
@@ -1573,44 +1610,45 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
     url = f"http://{host}:{port}{login_path}"
     log.info("Dr.COM 登录接口: %s (账号字段 %s / 密码字段 %s)", url, user_field, pass_field)
 
+    # 服务类型顺序: 配置指定 > 上次成功的 > 依次试
     pinned = cfg.get("wifi_suffix", "")
-    cached_before = pinned if pinned else load_carrier(net.source_ip)
+    cached = pinned if pinned else load_carrier(net.source_ip)
     if pinned:
-        # 配置里写死了服务类型, 就只用它
-        forms = [(f"配置指定 {pinned}", f"{account}{pinned}", pinned)]
+        suffixes = [(f"配置指定 {pinned}", pinned)]
     else:
-        # 学校三家运营商走同一个门户, 但账号后缀不同:
-        #   校园用户(默认) = 不带后缀 / 校园电信 = @dx / 校园联通 = @lt
-        # 先试上次成功过的那个, 再依次试其它 —— 这样联通/电信的同学也能自动适配,
-        # 而且第二次起只用试一个, 不会平白多打几次请求。
-        cached = cached_before
-        forms = []
+        suffixes = []
         if cached is not None:
-            label = "上次成功(默认)" if cached == "" else f"上次成功({cached})"
-            forms.append((label, f"{account}{cached}", cached))
+            suffixes.append(("上次成功(默认)" if cached == "" else f"上次成功({cached})", cached))
         for label, suffix in CARRIERS:
             if suffix != cached:
-                forms.append((label, f"{account}{suffix}", suffix))
+                suffixes.append((label, suffix))
+
+    # 组合顺序: 先"上次成功的服务类型"配各个账号, 再换服务类型 —— 常见情况 1~2 次就能中
+    attempts = []
+    for suf_label, suffix in suffixes:
+        for cred_label, account, password in creds:
+            attempts.append((f"{cred_label} + {suf_label}", account, password, suffix))
+    attempts = attempts[:8]          # 兜底上限, 别打太多请求
 
     modern_url = (f"http://{host}:{port}/eportal/portal/login?callback=dr1003"
-                  "&login_method=1&user_account=%2C0%2C" + urllib.parse.quote(account)
-                  + "&user_password=" + urllib.parse.quote(password)
+                  "&login_method=1&user_account=%2C0%2C"
+                  + urllib.parse.quote(creds[0][1] if creds else "")
+                  + "&user_password=" + urllib.parse.quote(creds[0][2] if creds else "")
                   + "&jsVersion=4.1.3&terminal_type=1&lang=zh-cn")
 
     if dry_run:
-        for name, user_value, _suffix in forms:
-            body = {user_field: user_value, pass_field: "***", "0MKKey": "123456",
+        for label, _acc, _pw, suffix in attempts:
+            body = {user_field: f"<账号>{suffix}", pass_field: "***", "0MKKey": "123456",
                     "R1": "", "R2": "", "R3": "", "R6": "0", "para": "", "v6ip": "",
                     "terminal_type": "1", "lang": "zh-cn", "url": "drappall"}
-            log.info("[演练] POST %s  body=%s", url, body)
-        log.info("[演练] 后备(GET): %s", re.sub(r"user_password=[^&]*", "user_password=***", modern_url))
+            log.info("[演练] POST %s  %s  body=%s", url, label, body)
         log.info("[演练] 到此为止, 不发送密码")
         return False
 
     errors: list[str] = []
-    for form_name, user_value, form_suffix in forms:
+    for label, account, password, form_suffix in attempts:
         data = {
-            user_field: user_value,
+            user_field: f"{account}{form_suffix}",
             pass_field: password,
             "0MKKey": "123456",
             "R1": "", "R2": "", "R3": "", "R6": "0", "para": "", "v6ip": "",
@@ -1620,16 +1658,15 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
         if js_version:
             data["jsVersion"] = js_version
 
-        log.info("Dr.COM 登录: 服务类型 %s", form_name)
-        # ajax=True 很关键: 不带这个头 AC 会返回后台管理页面
+        log.info("Dr.COM 登录: %s", label)
         resp = sess.request(url, method="POST", data=data, ajax=True)
         text = resp.text.strip().replace("\n", " ")[:200]
         log.info("  → HTTP %s: %s", resp.status, text)
         _dump("drcom-ACSetting", resp.text)
 
-        # 这些是"换服务类型也没用"的硬错误 —— 立刻停手, 不要反复撞
+        # 这些是"换账号/换服务类型也没用"的硬错误 —— 立刻停手, 不要反复撞
         # 注意: 「账号错误 / Authentication fail / 请先绑定运营商」都**不算**硬错误,
-        #      因为它们正是"服务类型选错了"的表现, 需要换下一个后缀再试。
+        #      因为它们正是"账号或服务类型选错了"的表现, 需要换下一个再试。
         fatal = ("密码", "验证码", "在线数超出限制", "Limit Users")
         hit = next((w for w in fatal if w in resp.text), "")
         if hit:
@@ -1637,35 +1674,31 @@ def login_drcom(net: NetEnv, cfg: dict, account: str, password: str,
                 log.error("门户要求图形验证码, 纯 HTTP 模式无法识别(需用浏览器模式)")
             elif "在线数超出限制" in resp.text or "Limit Users" in resp.text:
                 log.error("账号在线设备数超限(该账号同时在别的设备/会话上在线)。"
-                          "这不是密码问题, 换个后缀也没用 —— 已停止重试。"
+                          "这不是密码问题 —— 已停止重试。"
                           "处理: 等旧会话超时, 或先在别的设备上退出登录。")
             else:
                 log.error("服务器明确拒绝(%s), 停止重试以免反复撞: %s", hit, text)
             return False
 
         if _wait_online(net, cfg, 8):
-            log.info("Dr.COM 登录成功(服务类型: %s)", form_name)
-            if cached_before != form_suffix:
+            log.info("Dr.COM 登录成功(%s)", label)
+            if cached is None or cached != form_suffix:
                 save_carrier(form_suffix, net.source_ip)
-                log.info("已记住该账号的服务类型(%s)，下次直接用它",
-                         "默认不带后缀" if form_suffix == "" else form_suffix)
+                log.info("已记住: 本网段用 %s + 服务类型 %s",
+                         account, "不带后缀" if form_suffix == "" else form_suffix)
+            if cached is not None and cached != form_suffix:
+                # 记一下这个网段该用哪个账号
+                remember_account(account, net.source_ip)
             return True
-        log.info("  服务类型 %s 未成功, 换下一个", form_name)
         errors.append(text)
+        log.info("  %s 未成功, 换下一个组合", label)
 
-    # 后备: 新版 JSONP 接口(本校实测通常不可用, 但别的 AC 版本可能只有它)
-    log.info("老接口都未成功, 试后备的新版 JSONP 接口")
-    resp = sess.request(modern_url)
-    log.info("  → HTTP %s: %s", resp.status, resp.text.strip()[:160])
-    if _wait_online(net, cfg, 10):
-        return True
-
-    log.error("Dr.COM 门户登录失败(试过 %s 种服务类型)", len(forms))
+    log.error("Dr.COM 门户登录失败(试过 %s 种组合)", len(attempts))
     if errors and all(("Authentication fail" in e or "账号错误" in e) for e in errors):
-        log.error("所有服务类型都被拒。常见原因:")
-        log.error("  1) 账号密码不对")
-        log.error("  2) 换了一张校园网(比如从移动换到电信), 但这张网的账号还没存过 ——")
-        log.error("     连着这张网运行一次:  python3 campus_mac.py --set-password")
+        log.error("所有组合都被拒。常见原因:")
+        log.error("  1) 账号密码不对 —— 用 --set-password 重新存")
+        log.error("  2) 这张校园网的账号还没存过 —— 连着这张网运行一次:")
+        log.error("       python3 campus_mac.py --set-password")
         log.error("  3) 这家运营商还没绑定账号(提示里会写「请先绑定运营商账号」)")
     return False
 
@@ -1716,18 +1749,30 @@ def do_login(cfg: dict, net: NetEnv, dry_run: bool = False, force: bool = False)
         if flow == "cas" and str(cfg.get("wired_flow", "drcom")).lower() == "drcom":
             log.info("有线网段: 按配置改用 Dr.COM 表单登录(绕过统一认证的人脸识别)")
             flow = "drcom"
-        try:
-            account, password = load_credentials(cfg, "cas" if flow == "cas" else "drcom",
-                                                 net.source_ip)
-        except SystemExit:
-            if not dry_run:
-                raise
-            account, password = "TEST-ACCOUNT", "TEST-PASSWORD"
-            log.info("[演练] 尚未保存账号密码, 用占位符走一遍流程")
-        log.info("开始登录流程: %s (网卡 %s, 源地址 %s)", flow, net.iface, net.source_ip)
         if flow == "cas":
+            try:
+                account, password = load_credentials(cfg, "cas", net.source_ip)
+            except SystemExit:
+                if not dry_run:
+                    raise
+                account, password = "TEST-ACCOUNT", "TEST-PASSWORD"
+                log.info("[演练] 尚未保存账号密码, 用占位符走一遍流程")
+            log.info("开始登录流程: cas (网卡 %s, 源地址 %s)", net.iface, net.source_ip)
             return login_cas(net, cfg, account, password, dry_run)
-        return login_drcom(net, cfg, account, password, dry_run)
+
+        # Dr.COM: 把所有存过密码的账号都带上 —— 换到另一张校园网(账号不同)时也能自动试对
+        creds = credential_candidates(cfg, net.source_ip)
+        if not creds:
+            if not dry_run:
+                raise SystemExit(
+                    "还没有保存账号密码。请先执行:\n"
+                    "    python3 campus_mac.py --set-password"
+                )
+            creds = [("演练账号", "TEST-ACCOUNT", "TEST-PASSWORD")]
+            log.info("[演练] 尚未保存账号密码, 用占位符走一遍流程")
+        log.info("开始登录流程: drcom (网卡 %s, 源地址 %s, 候选账号 %d 个)",
+                 net.iface, net.source_ip, len(creds))
+        return login_drcom(net, cfg, creds, dry_run)
     finally:
         release_lock()
 
