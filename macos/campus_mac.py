@@ -108,7 +108,7 @@ DEFAULT_CONFIG = {
     "pinned_hosts": {},
     "drcom_extra_query": {},
     # 本机版本号(与 Release 的 tag 一致), 用于"检查更新"
-    "version": "v1.3-macos",
+    "version": "v1.3.1-macos",
     # 无线门户的"服务类型": 留空=依次试 校园用户/@njxy/@dx/@lt
     "wifi_suffix": "",
     # 有线网段默认也走 Dr.COM 表单 —— 实测(2026-09-15)可行,
