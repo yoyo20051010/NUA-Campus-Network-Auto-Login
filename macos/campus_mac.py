@@ -91,7 +91,7 @@ DEFAULT_CONFIG = {
     # 校园网自己用的"有线/无线"判据, 抄自门户页 a41.js
     "cas_ip_ranges": [["1.1.1.1", "10.51.255.255"], ["10.128.0.1", "10.129.255.255"]],
     "interval": 30,
-    "interval_battery": 120,
+    "interval_battery": 60,
     # 夜间静默: 学校这段时间不允许学生账号认证, 干脆完全不发请求
     "quiet_hours": {"enabled": True, "start": "00:00", "end": "06:00",
                     "days": [0, 1, 2, 3, 4]},
@@ -919,7 +919,39 @@ def net_config_mtime() -> float:
         return 0.0
 
 
-def wait_for_change(seconds: int) -> str:
+def local_ip_fast(host: str) -> str:
+    """
+    极快地取"本机到 host 会用哪个源地址" —— 一次 UDP connect + getsockname,
+    **不发包、不开子进程**, 微秒级。切换 WiFi / 插拔网线时它必然变化。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((host, 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return ""
+
+
+def net_fingerprint() -> str:
+    """
+    所有物理网卡的 IPv4 组合 —— 用来判断"网络变了没"。
+
+    为什么不只用 local_ip_fast: 到门户的路由可能被 VPN 的 TUN 接管(实测 Clash 开启时
+    会返回 198.18.0.1), 那个地址不会随 WiFi 切换而变。而网卡地址一定会变。
+    (这个函数要跑一次 ifconfig, 所以别调太勤 —— 默认每 ~10 秒一次。)
+    """
+    try:
+        addrs = iface_addresses()
+        return ",".join(sorted(
+            f"{name}={info.get('ipv4', '')}"
+            for name, info in addrs.items()
+            if info.get("ipv4") and iface_kind(name, hardware_ports()) != "virtual"
+        ))
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+def wait_for_change(seconds: int, portal_host: str = "10.255.255.2") -> str:
     """
     分片睡眠, 期间盯着两个"该立刻醒来干活"的信号:
       合盖睡眠→唤醒(时间跳变)  -> "wake"
@@ -928,16 +960,27 @@ def wait_for_change(seconds: int) -> str:
     """
     remaining = float(seconds)
     baseline = net_config_mtime()
+    baseline_ip = local_ip_fast(portal_host)
+    baseline_fp = net_fingerprint()
+    tick = 0
     while remaining > 0:
-        chunk = min(5.0, remaining)
+        chunk = min(3.0, remaining)
         before = time.time()
         time.sleep(chunk)
         after = time.time()
         remaining -= chunk
+        tick += 1
         if after - before > chunk + 30:
             return "wake"
         current = net_config_mtime()
         if current and current != baseline:
+            return "network"
+        # 到门户的源地址变了(切换 WiFi / VPN 改道)
+        if local_ip_fast(portal_host) != baseline_ip:
+            return "network"
+        # 网卡地址变了 —— 实测 preferences.plist 在"切换 WiFi"时根本不变(只有增减接口才变),
+        # 所以这个指纹才是切换 WiFi 时真正可靠的信号。ifconfig 有点开销, 每 ~10 秒查一次。
+        if tick % 3 == 0 and net_fingerprint() != baseline_fp:
             return "network"
     return ""
 
@@ -948,7 +991,7 @@ def interval_for(cfg: dict, state: str) -> int:
     if state == STATE_NOT_CAMPUS:
         interval = max(interval, int(cfg.get("interval_offcampus", 300)))
     if on_battery():
-        interval = max(interval, int(cfg.get("interval_battery", 120)))
+        interval = max(interval, int(cfg.get("interval_battery", 60)))
     return interval
 
 
@@ -2136,7 +2179,7 @@ def cmd_login(cfg: dict, net: NetEnv, dry_run: bool, force: bool = False) -> int
 def cmd_watch(cfg: dict, net: NetEnv) -> int:
     log.info("看门狗启动(在线 %s 秒一轮; 不在校园网 %s 秒; 电池模式不低于 %s 秒)",
              cfg.get("interval", 30), cfg.get("interval_offcampus", 300),
-             cfg.get("interval_battery", 120))
+             cfg.get("interval_battery", 60))
     data = load_retry()
     failures = int(data.get("failures", 0))
     next_attempt = float(data.get("next_attempt", 0))
@@ -2155,8 +2198,9 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
                 note_mode("quiet", "进入夜间静默时段 %s-%s: 学校这段时间不让认证, "
                                    "暂停所有网络请求, 到点自动恢复" % (
                                        quiet.get("start", "00:00"), quiet.get("end", "06:00")))
+                portal_host = urllib.parse.urlsplit(cfg["portal_url"]).hostname or "10.255.255.2"
                 while in_quiet_hours(cfg, account=quiet_account):
-                    wait_for_change(300)
+                    wait_for_change(300, portal_host)
                 note_mode("normal", "夜间静默时段结束, 恢复常规检查")
                 state = STATE_UNKNOWN
                 continue
@@ -2205,7 +2249,8 @@ def cmd_watch(cfg: dict, net: NetEnv) -> int:
         except Exception as exc:                              # noqa: BLE001
             log.exception("看门狗循环异常: %s", exc)
 
-        reason = wait_for_change(interval_for(cfg, state))
+        portal_host = urllib.parse.urlsplit(cfg["portal_url"]).hostname or "10.255.255.2"
+        reason = wait_for_change(interval_for(cfg, state), portal_host)
         if reason == "wake":
             log.info("检测到睡眠唤醒(合盖/休眠结束), 立即重新检查")
         elif reason == "network":

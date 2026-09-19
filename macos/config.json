@@ -39,7 +39,7 @@
   ],
   "pinned_hosts": {},
   "drcom_extra_query": {},
-  "interval_battery": 120,
+  "interval_battery": 60,
   "interval_offcampus": 300,
   "drcom_legacy_fallback": false,
   "keychain_cas_service": "campus-net-cas",
