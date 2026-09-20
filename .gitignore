@@ -1,6 +1,8 @@
 # ---- 凭据（千万不要提交）----
 secret.json
 secret.bin
+secret*.json
+secret*.json.*
 
 # ---- 运行产物 ----
 logs/
@@ -20,3 +22,6 @@ runtime/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- 本机私有（同步仓库前备份的旧文件，确认无误后可删）----
+_本地旧版备份/
