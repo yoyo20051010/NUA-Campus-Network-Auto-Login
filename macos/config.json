@@ -11,7 +11,7 @@
   "_accounts说明": "按网段记的账号: 键是客户端 IP 前两段(如 10.53)。移动/电信/联通的 Wi-Fi 账号不同时, 各连一次各存一次即可, 用 --set-password 自动写入。",
   "accounts": {},
   "keychain_service": "campus-net-login",
-  "version": "v1.3.1-macos",
+  "version": "v1.4-macos",
   "_version说明": "本机版本号, 与 Release 的 tag 保持一致; 用于检查更新",
   "notify": true,
   "_notify说明": "登录成功/失败/掉线时弹 macOS 系统通知; 不想被打扰就改成 false",
