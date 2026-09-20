@@ -19,7 +19,7 @@ if (-not (Test-Path (Join-Path $AppDir 'campus_http.py'))) {
     # 脚本放在 tools/ 时，仓库根目录在上一层
     $AppDir = Split-Path -Parent $AppDir
 }
-$Version = '1.2'
+$Version = '1.4'
 
 function Build-Package {
     param([bool]$IsLite)
@@ -54,6 +54,9 @@ function Build-Package {
         Copy-Item -LiteralPath $src -Destination $Pkg
     }
     Copy-Item -LiteralPath (Join-Path $AppDir 'openwrt') -Destination $Pkg -Recurse
+    # 别把本机跑测试留下的 __pycache__ 带进去（那是 3.14 的字节码，路由器用不上）
+    Get-ChildItem -LiteralPath (Join-Path $Pkg 'openwrt') -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force
 
     # 自带运行环境
     $RuntimeSrc = Join-Path $AppDir 'runtime'
