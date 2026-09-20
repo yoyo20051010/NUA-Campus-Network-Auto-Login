@@ -70,11 +70,12 @@ APP_DIR = pathlib.Path(__file__).resolve().parent
 # --------------------------------------------------------------------------- #
 class Profile:
     def __init__(self, name: str, base: pathlib.Path,
-                 device: str = "", account_type: str = ""):
+                 device: str = "", account_type: str = "", mwan3: str = ""):
         self.name = name
         self.base = base
         self.device = device or ""            # 绑定的网卡名；空 = 按系统路由走
         self.default_account_type = account_type or ""
+        self.mwan3 = mwan3 or ""              # 对应的 mwan3 接口名；空 = 不联动（默认与线路同名）
         self.log_dir = base / "logs"
         self.config_file = base / "config.json"
         self.secret_file = base / "secret.json"
@@ -320,7 +321,8 @@ def load_profiles() -> list["Profile"]:
         base = item.get("dir") or (APP_DIR / "profiles" / name)
         profiles.append(Profile(name, pathlib.Path(base),
                                 str(item.get("device") or ""),
-                                str(item.get("account_type") or "")))
+                                str(item.get("account_type") or ""),
+                                str(item.get("mwan3") or "")))
     return profiles or [DEFAULT_PROFILE]
 
 
@@ -814,6 +816,51 @@ def ensure_source_route(device: str, ip: str, table: int) -> bool:
         return subprocess.run(["sh", "-c", script], capture_output=True, timeout=5).returncode == 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def sync_mwan3(profile: "Profile", online: bool) -> None:
+    """
+    把这条线的"认证状态"同步给 mwan3，让主备切换由认证结果驱动。
+
+    为什么不靠 mwan3 自己的 ping 探测：
+      路由器上实测踩过一次 —— mwan3 的跟踪进程会卡死（ping 子进程挂着不返回，
+      整个跟踪循环冻住）。结果一条线明明已经掉了认证，mwan3 却一直以为它在线，
+      主备切换彻底失效，宿舍直接断了网。而本脚本每 15 秒就在查校园网状态接口，
+      本来就知道每条线的真相，由它来通知 mwan3 最可靠。
+
+        online=True  -> mwan3 ifup   <名字>   把这条线放回可用池
+        online=False -> mwan3 ifdown <名字>   把这条线摘出去，流量走别的线
+
+    状态没变就不重复调用（ifup/ifdown 会重建一堆规则，没必要每 15 秒来一次）；
+    但每隔 10 分钟会强制重申一次，免得 mwan3 那边被别的途径改掉
+    （比如跟踪进程自己翻转、或者手工 ifup 过），这里能自动纠正回来。
+    """
+    name = (profile.mwan3 or "").strip()
+    if not name:
+        return
+    want = "up" if online else "down"
+    marker = profile.log_dir / "mwan3_state.txt"
+    try:
+        age = time.time() - marker.stat().st_mtime
+        if marker.read_text(encoding="utf-8").strip() == want and age < 600:
+            return
+    except OSError:
+        pass
+    try:
+        ok = subprocess.run(["mwan3", want, name],
+                            capture_output=True, timeout=20).returncode == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    if not ok:
+        profile.log.warning("通知 mwan3 %s %s 失败", name, want)
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(want, encoding="utf-8")
+    except OSError:
+        pass
+    profile.log.info("已通知 mwan3：%s %s（%s）", name, want,
+                     "这条线已认证" if online else "这条线未认证，让流量走其它线")
 
 
 class _BindDeviceMixin:
@@ -1376,11 +1423,15 @@ def _watch_one(profile: Profile, bind_ip: str | None = None) -> int:
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段({quiet.get('start','00:00')}-{quiet.get('end','06:00')})，"
                                    "学校此时不允许学生账号认证，暂停尝试")
+                # 夜间不尝试登录，但**仍然要看这条线是不是已经掉认证了** ——
+                # 学校正是断在这个时段，不告诉 mwan3 的话主备切换根本不会发生。
+                sync_mwan3(profile, is_online(sess, cfg, quiet=True))
                 time.sleep(300)
                 continue
 
             if is_online(sess, cfg, quiet=True):
                 clear_retry()
+                sync_mwan3(profile, True)
                 note_mode("normal", "网络已恢复，回到常规检查")
             else:
                 retry = load_retry()
@@ -1398,9 +1449,12 @@ def _watch_one(profile: Profile, bind_ip: str | None = None) -> int:
                     note_mode("normal", "不在校园网环境（门户不可达），跳过本次尝试")
                 else:
                     note_mode("login", "检测到未认证，开始尝试登录")
+                    # 在校园网、但这条线没通过认证 = 这条线现在不可用，先摘出去
+                    sync_mwan3(profile, False)
                     result = login(sess, cfg, account, password)
                     if result == "ok":
                         clear_retry()
+                        sync_mwan3(profile, True)
                     elif result == "offsite":
                         clear_retry()
                         note_mode("normal", "不在校园网环境（门户不可达），跳过本次尝试")

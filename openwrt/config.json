@@ -9,7 +9,7 @@
   "_wifi_suffix说明": "无线网(校园WiFi)登录用的服务类型后缀。留空=自动依次尝试 无/@njxy/@dx/@lt；如果你知道自己属于哪种，填上可减少尝试次数，例如 \"@dx\"",
   "wifi_suffix": "",
   "probe_url": "http://www.baidu.com/",
-  "_profiles说明": "多条线路（多账号 / 多上行）。填了这一段就是多线路模式：每条线在 profiles/<名字>/ 下有自己的 config.json、secret.json、logs/，一个进程里并行看护。留空数组 [] = 单线路模式（老样子，文件直接放在本目录）。device 填网卡名，脚本用 SO_BINDTODEVICE 把这条线的请求绑到那张网卡上（校园网按终端 IP 认证，绑错出口就白搭）；account_type 是这条线的默认账号类型。",
+  "_profiles说明": "多条线路（多账号 / 多上行）。填了这一段就是多线路模式：每条线在 profiles/<名字>/ 下有自己的 config.json、secret.json、logs/，一个进程里并行看护。留空数组 [] = 单线路模式（老样子，文件直接放在本目录）。device 填网卡名，脚本会把这条线的请求绑到那张网卡上（校园网按终端 IP 认证，绑错出口就白搭）；account_type 是这条线的默认账号类型；mwan3 填这条线对应的 mwan3 接口名（留空 = 不和 mwan3 联动）。",
   "profiles": [],
   "_interval说明": "检测间隔（秒）。15 秒 = 断网后最快 15 秒内发现并开始重连。在线时只发一个状态查询请求，保持静默不写日志。",
   "interval": 15,
