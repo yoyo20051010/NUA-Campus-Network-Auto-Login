@@ -34,6 +34,7 @@ import logging
 import pathlib
 import re
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -209,7 +210,8 @@ def quiet_hours_exempt(cfg: dict, account: str) -> bool:
 def saved_account() -> str:
     """取已保存的账号（没保存过就返回空串）—— 用来判断这个账号是否受夜间限制。"""
     try:
-        return load_secret()[0]
+        account, _password = load_secret()
+        return account
     except SystemExit:
         return ""
 
@@ -307,6 +309,87 @@ def load_secret() -> tuple[str, str]:
     return obj["account"], obj["password"]
 
 
+# --------------------------------------------------------------------------- #
+# 选择网络出口
+#
+# 电脑同时连着有线和无线时，Windows 按接口跃点数选路（有线的跃点通常更低），
+# 所以访问门户的请求会从有线出去 —— 而学校看到的是路由器 WAN 的地址（已认证），
+# 于是登录页直接显示"已登录"，根本轮不到无线那份账号。
+#
+# 解决办法：把 socket 绑定到无线网卡的地址，强制请求从 WiFi 出去。
+# 只影响这个程序自己发的请求，不动系统路由表、不影响别的软件的连接。
+# --------------------------------------------------------------------------- #
+# 校园无线网段，用来在没写死网卡名时猜哪张网卡是无线
+WIFI_NET_RANGES = [("10.52.0.0", "10.63.255.255")]
+
+
+def _ip_in(ip: str, low: str, high: str) -> bool:
+    try:
+        value = _ip_to_int(ip)
+    except (ValueError, IndexError):
+        return False
+    return _ip_to_int(low) <= value <= _ip_to_int(high)
+
+
+def list_local_ipv4() -> list[tuple[str, str]]:
+    """列出本机所有 IPv4 地址，返回 [(网卡名, 地址), ...]。"""
+    pairs: list[tuple[str, str]] = []
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |"
+             " Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |"
+             " ForEach-Object { $_.InterfaceAlias + '|' + $_.IPAddress }"],
+            capture_output=True, timeout=20,
+        )
+        for line in out.stdout.decode("utf-8", "ignore").splitlines():
+            if "|" in line:
+                name, ip = line.split("|", 1)
+                pairs.append((name.strip(), ip.strip()))
+    except Exception:  # noqa: BLE001
+        pass
+    if pairs:
+        return pairs
+
+    # PowerShell 不可用时的退路：解析 ipconfig
+    try:
+        out = subprocess.run(["ipconfig"], capture_output=True, timeout=20)
+        current = "?"
+        for line in out.stdout.decode("gbk", "ignore").splitlines():
+            text = line.strip()
+            if text.endswith(":") and ("适配器" in text or "adapter" in text.lower()):
+                current = text[:-1]
+                continue
+            m = re.search(r"IPv4[^:]*:\s*([0-9.]+)", line)
+            if m:
+                pairs.append((current, m.group(1)))
+    except Exception:  # noqa: BLE001
+        pass
+    return pairs
+
+
+def resolve_bind_ip(value: str | None) -> str | None:
+    """
+    把 --bind 的值解析成要绑定的本机地址。
+
+    写 "wifi" / "auto" / "无线" 就自动找无线网卡：先按网卡名
+    （WLAN / 无线 / Wi-Fi / WiFi），再按校园无线网段猜。直接给 IP 则原样使用。
+    """
+    if not value:
+        return None
+    if value.strip().lower() not in ("wifi", "auto", "无线", "无线网卡"):
+        return value.strip()
+
+    candidates = list_local_ipv4()
+    for name, ip in candidates:
+        if any(k in name.lower() for k in ("wlan", "wifi", "wi-fi", "无线")):
+            return ip
+    for _name, ip in candidates:
+        if any(_ip_in(ip, low, high) for low, high in WIFI_NET_RANGES):
+            return ip
+    return None
+
+
 class Session:
     """
     带 Cookie 的极简 HTTP 会话。
@@ -319,6 +402,7 @@ class Session:
     def __init__(self, timeout: int = 8, bind_ip: str | None = None):
         self.timeout = timeout
         self.bind_ip = bind_ip
+        self.last_location = ""      # 最近一次响应的 Location，用来判断是不是被门户劫持
         self.jar = http.cookiejar.CookieJar()
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -348,12 +432,21 @@ class Session:
                 pass
 
     def _request_bound(self, url: str, data: dict | None, ajax: bool, method: str | None):
-        """把请求绑定到指定源地址发出（只支持 http，用于调试无线网段）。"""
+        """把请求绑定到指定源地址发出（http 和 https 都支持）。"""
         parts = urllib.parse.urlsplit(url)
-        conn = http.client.HTTPConnection(
-            parts.hostname, parts.port or 80, timeout=self.timeout,
-            source_address=(self.bind_ip, 0),
-        )
+        if parts.scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE      # 学校证书链不完整时也能用
+            conn = http.client.HTTPSConnection(
+                parts.hostname, parts.port or 443, timeout=self.timeout,
+                context=ctx, source_address=(self.bind_ip, 0),
+            )
+        else:
+            conn = http.client.HTTPConnection(
+                parts.hostname, parts.port or 80, timeout=self.timeout,
+                source_address=(self.bind_ip, 0),
+            )
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -373,6 +466,7 @@ class Session:
             conn.request(method or ("POST" if data is not None else "GET"), path, body=body, headers=headers)
             resp = conn.getresponse()
             self._store_cookies(resp.headers)
+            self.last_location = resp.headers.get("Location") or ""
             return resp.status, resp.read().decode("utf-8", "ignore")
         except Exception as exc:  # noqa: BLE001
             return -1, f"{type(exc).__name__}: {exc}"
@@ -381,7 +475,7 @@ class Session:
 
     def request(self, url: str, data: dict | None = None, ajax: bool = False,
                 method: str | None = None) -> tuple[int, str]:
-        if self.bind_ip and url.startswith("http://"):
+        if self.bind_ip:
             return self._request_bound(url, data, ajax, method)
         body = None
         headers = {"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9"}
@@ -393,8 +487,10 @@ class Session:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
+                self.last_location = resp.headers.get("Location") or ""
                 return resp.status, resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as exc:
+            self.last_location = (exc.headers.get("Location") or "") if exc.headers else ""
             return exc.code, exc.read().decode("utf-8", "ignore")
         except Exception as exc:
             return -1, f"{type(exc).__name__}: {exc}"
@@ -403,21 +499,38 @@ class Session:
 # --------------------------------------------------------------------------- #
 # 在线判断
 # --------------------------------------------------------------------------- #
+# 未认证时校园网会把请求劫持到门户；这些标记出现在页面或跳转地址里就说明没通
+PORTAL_MARKERS = ("Dr.COMWebLogin", "DrcomServer", "eportal", "10.255.255.2")
+
+
+def _looks_online(sess: Session, code: int, text: str) -> bool:
+    """
+    判断这次探测是不是"网络真的通了"。
+
+    认证通过后拿到的是正常响应：可能是 200，也可能是 3xx 跳转
+    （百度就回 302 跳 HTTPS）。绑定出口时走的是底层 http.client，它不自动跟随跳转，
+    所以只认 200 会把"其实已经通了"误判成失败。
+    """
+    if any(marker in text for marker in PORTAL_MARKERS):
+        return False
+    if any(marker in sess.last_location for marker in PORTAL_MARKERS):
+        return False
+    if code == 200:
+        return True
+    return 300 <= code < 400
+
+
 def is_online(sess: Session, cfg: dict, quiet: bool = False) -> bool:
-    # 绑定源地址调试时不能查状态接口（HTTPS 不支持绑定），否则会查到别的网卡的状态
-    if not sess.bind_ip:
-        status, body = sess.request(cfg["status_url"], data={}, ajax=True)
-        if status == 200 and body.strip().startswith("{"):
-            try:
-                if json.loads(body).get("success"):
-                    return True
-            except ValueError:
-                pass
-    else:
-        body = ""
+    status, body = sess.request(cfg["status_url"], data={}, ajax=True)
+    if status == 200 and body.strip().startswith("{"):
+        try:
+            if json.loads(body).get("success"):
+                return True
+        except ValueError:
+            pass
     # 接口不可用或者返回未登录时，用真实访问复核（未认证时会被门户劫持）
     code, text = sess.request(cfg["probe_url"])
-    if code == 200 and "Dr.COMWebLogin" not in text and "DrcomServer" not in text:
+    if _looks_online(sess, code, text):
         return True
     if not quiet:
         log.info("判定为未认证（状态接口返回 %s）", body[:120])
@@ -822,8 +935,8 @@ def cmd_set_password() -> None:
     print(f"已保存到 {SECRET_FILE}（建议 chmod 600）")
 
 
-def cmd_watch(cfg: dict) -> int:
-    sess = Session(cfg["timeout"])
+def cmd_watch(cfg: dict, bind_ip: str | None = None) -> int:
+    sess = Session(cfg["timeout"], bind_ip=bind_ip)
     account, password = load_secret()
     log.info("看门狗启动，每 %s 秒检测一次", cfg["interval"])
     while True:
@@ -858,7 +971,7 @@ def cmd_watch(cfg: dict) -> int:
         time.sleep(int(cfg["interval"]))
 
 
-def cmd_login(cfg: dict) -> int:
+def cmd_login(cfg: dict, bind_ip: str | None = None) -> int:
     """
     执行一次登录。
 
@@ -867,8 +980,11 @@ def cmd_login(cfg: dict) -> int:
       2. 已经在线 / 不在校园网 都不尝试
       3. 登录失败后按 2/5/15/30 分钟退避，避免每分钟都去撞墙
     每种情况只在"状态变化"时写一行日志。
+
+    bind_ip 不为空 = 手动指定出口（比如让认证走无线网卡）。
+    这属于人工操作，所以不套用自动模式的失败退避。
     """
-    sess = Session(cfg["timeout"])
+    sess = Session(cfg["timeout"], bind_ip=bind_ip)
     now_ts = time.time()
 
     if in_quiet_hours(cfg, account=saved_account()):
@@ -886,7 +1002,7 @@ def cmd_login(cfg: dict) -> int:
         note_mode("normal", "不在校园网环境，跳过")
         return 0
 
-    retry = load_retry()
+    retry = {} if bind_ip else load_retry()
     next_attempt = float(retry.get("next_attempt", 0) or 0)
     if next_attempt > now_ts:
         minutes = int((next_attempt - now_ts) // 60) + 1
@@ -914,6 +1030,9 @@ def main() -> int:
     parser.add_argument("--watch", action="store_true", help="常驻看门狗")
     parser.add_argument("--set-password", action="store_true", help="保存账号密码")
     parser.add_argument("--probe", action="store_true", help="探测门户走的是哪套登录流程（不登录）")
+    parser.add_argument("--bind", metavar="IP|wifi",
+                        help="把请求绑定到指定网卡发出：给本机地址，或写 wifi 自动识别无线网卡。"
+                             "同时连着有线和无线时用它让认证走无线，不用拔网线")
     parser.add_argument("--quiet", action="store_true", help="不输出到控制台")
     args = parser.parse_args()
 
@@ -930,7 +1049,23 @@ def main() -> int:
         if args.set_password:
             cmd_set_password()
             return 0
-        sess = Session(cfg["timeout"])
+        bind_ip = resolve_bind_ip(args.bind)
+        if bind_ip and args.bind.strip().lower() not in ("wifi", "auto", "无线", "无线网卡"):
+            # 手写的 IP：确认它确实是本机地址，不然请求会以很难懂的方式失败
+            local = [ip for _name, ip in list_local_ipv4()]
+            if local and bind_ip not in local:
+                log.error("%s 不是本机地址，本机现有地址：", bind_ip)
+                for name, ip in list_local_ipv4():
+                    log.error("  %s  %s", name, ip)
+                return 2
+        if args.bind and not bind_ip:
+            log.error("没能从 '%s' 找到可用的本机地址。本机现有地址：", args.bind)
+            for name, ip in list_local_ipv4():
+                log.error("  %s  %s", name, ip)
+            return 2
+        if bind_ip:
+            log.info("网络出口绑定到本机地址 %s（只有本程序的请求走这张网卡）", bind_ip)
+        sess = Session(cfg["timeout"], bind_ip=bind_ip)
         if args.probe:
             code, html = sess.request(cfg["portal_url"])
             ip = client_ip_from_portal(html)
@@ -947,9 +1082,9 @@ def main() -> int:
             log.info("当前状态: %s", "已在线" if online else "未认证/已断网")
             return 0 if online else 1
         if args.watch:
-            return cmd_watch(cfg)
+            return cmd_watch(cfg, bind_ip)
         if args.login:
-            return cmd_login(cfg)
+            return cmd_login(cfg, bind_ip)
     except SystemExit:
         raise
     except Exception:
