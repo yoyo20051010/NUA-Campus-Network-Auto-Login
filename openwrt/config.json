@@ -9,33 +9,38 @@
   "_wifi_suffix说明": "无线网(校园WiFi)登录用的服务类型后缀。留空=自动依次尝试 无/@njxy/@dx/@lt；如果你知道自己属于哪种，填上可减少尝试次数，例如 \"@dx\"",
   "wifi_suffix": "",
   "probe_url": "http://www.baidu.com/",
-  "interval": 60,
+  "_profiles说明": "多条线路（多账号 / 多上行）。填了这一段就是多线路模式：每条线在 profiles/<名字>/ 下有自己的 config.json、secret.json、logs/，一个进程里并行看护。留空数组 [] = 单线路模式（老样子，文件直接放在本目录）。device 填网卡名，脚本用 SO_BINDTODEVICE 把这条线的请求绑到那张网卡上（校园网按终端 IP 认证，绑错出口就白搭）；account_type 是这条线的默认账号类型。",
+  "profiles": [],
+  "_interval说明": "检测间隔（秒）。15 秒 = 断网后最快 15 秒内发现并开始重连。在线时只发一个状态查询请求，保持静默不写日志。",
+  "interval": 15,
   "login_timeout": 90,
   "timeout": 8,
-  "_quiet_hours说明": "夜间限制时段：学校不允许学生账号认证的时段，脚本不尝试登录也不发请求。days 0=周一 … 6=周日，默认周一~周五 00:00-06:00。",
+  "_account_type说明": "账号类型：student=学生账号（受学校夜间断网限制）；teacher=教师账号（不受限制，整夜也正常检测并自动登录）。**留空 = 按账号前缀自动判断**（推荐，默认）。优先级：secret.json（--set-password / --mode 写的）> 这里的值（非空时）> 按前缀自动判断。",
+  "account_type": "",
+  "_teacher_account_prefixes说明": "没手动设过账号类型时，按账号前缀自动判断：教师工号（M 开头）所有时段都能认证，学生学号（B 开头）只有周六日 24 小时可用。实测学校的时段限制是按账号分的、不是按网段，所以这里按账号判断。",
+  "teacher_account_prefixes": ["M"],
+  "_quiet_hours_exempt_accounts说明": "例外名单：这些账号完全不受夜间限制时段影响（除了前缀匹配之外，还可以在这里精确列账号）。",
+  "quiet_hours_exempt_accounts": [],
+  "_quiet_hours说明": "夜间限制时段：学校不允许学生账号认证的时段，脚本不尝试登录也不发请求。days 0=周一 … 6=周日，默认周一~周五 00:00-06:00。注意：account_type=teacher 时这一段自动失效。",
   "quiet_hours": {
     "enabled": true,
     "start": "00:00",
     "end": "06:00",
-    "days": [
-      0,
-      1,
-      2,
-      3,
-      4
-    ]
+    "days": [0, 1, 2, 3, 4]
   },
-  "_teacher账号说明": "教师账号前缀（默认 M）：这类账号所有时段都能认证，不受夜间限制时段影响。学生账号（学号 B 开头）只有周六日 24 小时可用，非周六日 00:00-06:00 无法认证 —— 正好对应 quiet_hours 的 days=[0,1,2,3,4]。",
-  "teacher_account_prefixes": [
-    "M"
-  ],
-  "quiet_hours_exempt_accounts": [],
-  "failure_backoff": [
-    120,
-    300,
-    900,
-    1800
-  ],
+  "failure_backoff": [120, 300, 900, 1800],
+  "_teacher_backoff说明": "教师模式下是否仍按 failure_backoff 退避。false=不退避，每个检测周期都重试（默认）；true=和学生账号一样按 2/5/15/30 分钟退避。",
+  "teacher_backoff": false,
+  "_teacher_fatal_cooldown说明": "教师模式下遇到“账号级问题”（密码错 / 在线数超出限制 / 已在线 / 要图形验证码）时的固定冷却秒数。这类问题重试没用，而且每 15 秒撞一次有把账号撞锁的风险。设成 0 = 完全不冷却。",
+  "teacher_fatal_cooldown": 300,
+  "_teacher说明": "教师账号专用覆盖项。留空=和其它账号完全一样。只有当学校给教师另开了一套门户/服务地址时才需要填：填了的项只在教师模式下生效。",
+  "teacher": {
+    "portal_url": "",
+    "cas_login_url": "",
+    "service": "",
+    "status_url": "",
+    "wifi_suffix": ""
+  },
   "_wired_flow说明": "有线网段用哪套登录：drcom=直接走 Dr.COM 表单（默认，可绕开统一认证的滑块/人脸验证）；cas=强制走统一身份认证。失败会自动用另一套再试。",
   "wired_flow": "drcom"
 }

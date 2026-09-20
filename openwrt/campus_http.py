@@ -22,30 +22,115 @@
     python campus_http.py --login            执行一次登录
     python campus_http.py --watch            常驻看门狗
     python campus_http.py --set-password     保存账号密码
+    python campus_http.py --mode teacher     切到教师账号模式（不受夜间限制）
+
+账号类型:
+    student（学生，默认）—— 受学校夜间断网策略限制，quiet_hours 时段不尝试认证
+    teacher（教师）    —— 没有这条限制，整夜照常检测在线状态并自动登录
 """
 
 from __future__ import annotations
 
 import argparse
+import contextvars
 import datetime
+import http.client
 import http.cookiejar
 import json
 import logging
+import logging.handlers
 import pathlib
 import re
+import socket
 import ssl
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
-LOG_DIR = APP_DIR / "logs"
-SECRET_FILE = APP_DIR / "secret.json"
-CONFIG_FILE = APP_DIR / "config.json"
-RETRY_FILE = LOG_DIR / "retry_state.json"
-MODE_FILE = LOG_DIR / "last_mode.txt"
+
+
+# --------------------------------------------------------------------------- #
+# 线路（profile）：一条线 = 一个账号 + 一个出口
+#
+# 每条线路自己一套 config.json / secret.json / logs/，互不干扰。
+# 只有一条线时保持老样子（文件直接放在 APP_DIR 下，完全兼容）；
+# 配了多条线时，每条线在 profiles/<名字>/ 下自己一份。
+#
+# 为什么要做成"一个进程多条线"而不是起多个进程：
+#   实测这个脚本进程的 RSS 就有 24MB，而路由器只剩 20MB 出头可用，
+#   起两个进程根本装不下；一个进程里多一条线只多一个 Session 对象。
+#
+# 下面这几个名字（LOG_DIR / SECRET_FILE / log ...）在全文里照旧用，
+# 一处都不用改：它们是指向"当前线路"的代理，多线程各看各的。
+# --------------------------------------------------------------------------- #
+class Profile:
+    def __init__(self, name: str, base: pathlib.Path,
+                 device: str = "", account_type: str = ""):
+        self.name = name
+        self.base = base
+        self.device = device or ""            # 绑定的网卡名；空 = 按系统路由走
+        self.default_account_type = account_type or ""
+        self.log_dir = base / "logs"
+        self.config_file = base / "config.json"
+        self.secret_file = base / "secret.json"
+        self.retry_file = self.log_dir / "retry_state.json"
+        self.mode_file = self.log_dir / "last_mode.txt"
+        self.log = logging.getLogger(f"campus_http.{name}")
+
+    def __repr__(self) -> str:
+        return f"<Profile {self.name} @ {self.base}>"
+
+
+DEFAULT_PROFILE = Profile("default", APP_DIR)
+_current_profile: contextvars.ContextVar = contextvars.ContextVar(
+    "profile", default=DEFAULT_PROFILE
+)
+
+
+def current() -> Profile:
+    """当前这条线路。"""
+    return _current_profile.get()
+
+
+class _PathProxy:
+    """指向"当前线路的某个路径"，用法和 pathlib.Path 完全一样。"""
+
+    def __init__(self, attr: str):
+        object.__setattr__(self, "_attr", attr)
+
+    def _path(self) -> pathlib.Path:
+        return getattr(current(), self._attr)
+
+    def __truediv__(self, other):  return self._path() / other
+    def __rtruediv__(self, other): return other / self._path()
+    def __getattr__(self, name):   return getattr(self._path(), name)
+    def __fspath__(self):          return str(self._path())
+    def __str__(self):             return str(self._path())
+    def __repr__(self):            return repr(self._path())
+    def __eq__(self, other):       return self._path() == other
+    def __hash__(self):            return hash(self._path())
+
+
+class _LogProxy:
+    """log.info(...) 转发到当前线路自己的 logger。"""
+
+    def __getattr__(self, name):
+        return getattr(current().log, name)
+
+
+LOG_DIR = _PathProxy("log_dir")
+SECRET_FILE = _PathProxy("secret_file")
+CONFIG_FILE = _PathProxy("config_file")
+RETRY_FILE = _PathProxy("retry_file")
+MODE_FILE = _PathProxy("mode_file")
+
+# 调试用的页面存档最多留几份（高频重试时防止把闪存写满）
+DUMP_KEEP = 30
 
 # 学校统一身份认证页面里写死的 RSA 公钥（指数 010001，模数见下）
 MODULUS_HEX = (
@@ -69,7 +154,24 @@ DEFAULT_CONFIG = {
     "interval": 60,
     "login_timeout": 90,
     "timeout": 8,
-    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每分钟去试
+    # 有线网段走哪套登录：drcom=优先走 Dr.COM 表单（可绕开统一认证的滑块/人脸验证），
+    # 失败再回退统一身份认证；cas=直接走统一身份认证。
+    "wired_flow": "drcom",
+    # 无线网(校园WiFi)登录用的服务类型后缀，留空 = 自动依次尝试
+    "wifi_suffix": "",
+    # 账号类型：student=学生账号，teacher=教师账号，**留空 = 自动判断**。
+    # 学生账号受学校"夜间断网"限制；教师账号没有这条限制，
+    # 所以 teacher 模式会自动忽略 quiet_hours，整夜照常检测并自动登录。
+    # 一般不用改这里 —— 用 --set-password / --mode 保存的类型优先级更高。
+    "account_type": "",
+    # 没手动设过账号类型时，按账号前缀自动判断：
+    # 教师工号（M 开头）所有时段都能认证；学生学号（B 开头）只有周六日 24 小时可用，
+    # 非周六日 00:00-06:00 无法认证 —— 正好对应下面 quiet_hours 的 days=[0,1,2,3,4]。
+    # 实测学校的时段限制是按**账号**分的，不是按网段，所以必须按账号判断。
+    "teacher_account_prefixes": ["M"],
+    "quiet_hours_exempt_accounts": [],
+    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每分钟去试。
+    # 注意：account_type=teacher 时这一段自动失效（教师账号夜里也能认证）。
     # days 用 Python 的星期编号：0=周一 … 6=周日。默认周一~周五的 00:00-06:00，
     # 正好覆盖"周日到周四晚上 24 点断网"的常见策略（周一 0 点~周五 6 点）。
     "quiet_hours": {
@@ -78,14 +180,17 @@ DEFAULT_CONFIG = {
         "end": "06:00",
         "days": [0, 1, 2, 3, 4],
     },
-    # 教师账号（工号，M 开头）所有时段都能认证，不受夜间限制时段影响；
-    # 学生账号（学号，B 开头）只有周六日 24 小时可用，非周六日 00:00-06:00 无法认证
-    # —— 正好对应上面 quiet_hours 的 days=[0,1,2,3,4]。
-    # 两张校园网（移动/电信）上学生账号和教师账号是混着用的，所以按**账号**判断，不按网段。
-    "teacher_account_prefixes": ["M"],
-    "quiet_hours_exempt_accounts": [],
     # 登录失败后的退避秒数：依次 2 分钟、5 分钟、15 分钟、30 分钟（之后一直 30 分钟）
     "failure_backoff": [120, 300, 900, 1800],
+    # 教师账号专用覆盖项：留空 = 和其它账号完全一样。
+    # 只有学校给教师另开了一套门户/服务地址时才需要填，填了就在这里生效。
+    "teacher": {
+        "portal_url": "",
+        "cas_login_url": "",
+        "service": "",
+        "status_url": "",
+        "wifi_suffix": "",
+    },
 }
 
 USER_AGENT = (
@@ -93,7 +198,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-log = logging.getLogger("campus_http")
+log = _LogProxy()
 
 
 # --------------------------------------------------------------------------- #
@@ -145,38 +250,131 @@ def rsa_encrypt(password: str) -> str:
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
-def setup_logging(verbose: bool = True) -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_DIR / "campus_http.log", encoding="utf-8")
+def setup_logging(verbose: bool = True, profile: "Profile | None" = None) -> None:
+    """给某条线路配好日志（文件 + 可选控制台）。同一个 logger 只配一次。"""
+    p = profile or current()
+    p.log_dir.mkdir(parents=True, exist_ok=True)
+    p.log.setLevel(logging.INFO)
+    if p.log.handlers:
+        return
+    # 多条线并行时行首标出是哪条线，不然日志混在一起分不清
+    tag = "" if p.name == DEFAULT_PROFILE.name else f"[{p.name}] "
+    fmt = logging.Formatter(f"%(asctime)s %(levelname)-7s {tag}%(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    # 15 秒一轮、失败还不退避的话日志会长得很快，所以限制单文件大小并滚动，
+    # 免得出问题的时候把路由器那点闪存写满。
+    fh = logging.handlers.RotatingFileHandler(
+        p.log_dir / "campus_http.log", maxBytes=512 * 1024, backupCount=2, encoding="utf-8"
+    )
     fh.setFormatter(fmt)
-    log.addHandler(fh)
+    p.log.addHandler(fh)
     if verbose and sys.stdout is not None:
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
-        log.addHandler(sh)
-    log.setLevel(logging.INFO)
+        p.log.addHandler(sh)
 
 
-def load_config() -> dict:
+def load_config(profile: "Profile | None" = None) -> dict:
+    """
+    三层合并：内置默认值 < APP_DIR/config.json（公共） < 本线路的 config.json（覆盖）。
+
+    只有一条线时前后两个文件其实是同一个，读两遍而已。
+    """
+    p = profile or current()
     cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_FILE.exists():
+    for path in (APP_DIR / "config.json", p.config_file):
         try:
-            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+            if path.exists():
+                cfg.update(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             pass
     return cfg
 
 
-# --------------------------------------------------------------------------- #
-# 夜间免打扰 + 失败退避（让日志和请求都安静下来）
-# --------------------------------------------------------------------------- #
-def _hhmm_to_minutes(text: str) -> int | None:
+def load_profiles() -> list["Profile"]:
+    """
+    读出所有线路。config.json 里的 profiles 长这样：
+
+      "profiles": [
+        {"name": "wan",  "device": "wan",    "account_type": "teacher"},
+        {"name": "wanb", "device": "br-lan", "account_type": "student"}
+      ]
+
+    没配 profiles（或配成空数组）= 老样子，只有一条线。
+    """
+    top = dict(DEFAULT_CONFIG)
     try:
-        hh, mm = text.split(":")
-        return int(hh) * 60 + int(mm)
-    except (ValueError, AttributeError):
+        top_file = APP_DIR / "config.json"
+        if top_file.exists():
+            top.update(json.loads(top_file.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+
+    profiles: list[Profile] = []
+    for item in top.get("profiles") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        base = item.get("dir") or (APP_DIR / "profiles" / name)
+        profiles.append(Profile(name, pathlib.Path(base),
+                                str(item.get("device") or ""),
+                                str(item.get("account_type") or "")))
+    return profiles or [DEFAULT_PROFILE]
+
+
+def _profile_names(profiles: list["Profile"]) -> str:
+    return "、".join(p.name for p in profiles)
+
+
+def resolve_profile(name: str | None) -> "Profile":
+    """按名字找线路；没给名字且只有一条线时就用那一条。"""
+    profiles = load_profiles()
+    if name:
+        for p in profiles:
+            if p.name == name:
+                return p
+        raise SystemExit(f"没有叫 '{name}' 的线路。已配置的线路：{_profile_names(profiles)}")
+    if len(profiles) == 1:
+        return profiles[0]
+    raise SystemExit("配了多条线路，请用 --profile 指定一条。已配置的线路："
+                     + _profile_names(profiles))
+
+
+# --------------------------------------------------------------------------- #
+# 账号类型：学生 / 教师
+#
+# 学校对学生账号有夜间断网策略（默认周一~周五 00:00-06:00 不允许认证），
+# 教师账号没有这条限制。于是把账号类型做成一个开关：
+#     student -> 照常遵守 quiet_hours
+#     teacher -> 忽略 quiet_hours，整夜正常检测在线状态并自动登录
+# 类型跟着账号一起存在 secret.json 里（config.json 的 account_type 只作兜底），
+# 用 --mode 随时切换，不用重新输密码。
+# --------------------------------------------------------------------------- #
+ACCOUNT_TYPES = ("student", "teacher")
+ACCOUNT_TYPE_LABEL = {"student": "学生账号", "teacher": "教师账号"}
+ACCOUNT_TYPE_ALIASES = {
+    "student": "student", "stu": "student", "s": "student", "1": "student", "学生": "student",
+    "teacher": "teacher", "tea": "teacher", "t": "teacher", "staff": "teacher",
+    "2": "teacher", "教师": "teacher", "老师": "teacher",
+}
+
+
+def normalize_account_type(value) -> str | None:
+    """把中文/英文/数字写法统一成 student / teacher，认不出来返回 None。"""
+    if value is None:
         return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in ACCOUNT_TYPE_ALIASES:
+        return ACCOUNT_TYPE_ALIASES[text]
+    if "教" in text or "师" in text:
+        return "teacher"
+    if "学" in text or "生" in text:
+        return "student"
+    return None
 
 
 def quiet_hours_exempt(cfg: dict, account: str) -> bool:
@@ -206,23 +404,72 @@ def quiet_hours_exempt(cfg: dict, account: str) -> bool:
     return any(account == str(name).strip() for name in exempt)
 
 
-def saved_account() -> str:
-    """取已保存的账号（没保存过就返回空串）—— 用来判断这个账号是否受夜间限制。"""
+def stored_account() -> str:
+    """取已保存的账号（没保存过/读不到就返回空串）—— 用来判断这个账号是否受夜间限制。"""
     try:
-        return load_secret()[0]
-    except SystemExit:
+        return load_secret()["account"]
+    except (SystemExit, KeyError):
         return ""
 
 
-def in_quiet_hours(cfg: dict, now: datetime.datetime | None = None, account: str = "") -> bool:
+def resolve_account_type(cfg: dict, stored: str | None = None, account: str = "") -> str:
+    """
+    生效的账号类型，优先级从高到低：
+
+      1. secret.json 里存的 account_type（--set-password / --mode 写的）
+      2. config.json 里的 account_type
+      3. **按账号前缀自动判断**：教师工号（M 开头）→ teacher，其余 → student
+
+    第 3 条来自实测：学校的夜间限制时段是按**账号**分的，不是按网段，
+    所以就算没手动设过类型，也应该能正确识别出教师账号。
+    """
+    for candidate in (stored, cfg.get("account_type")):
+        value = normalize_account_type(candidate)
+        if value:
+            return value
+    if quiet_hours_exempt(cfg, account or stored_account()):
+        return "teacher"
+    return "student"
+
+
+def apply_account_type(cfg: dict, account_type: str) -> dict:
+    """
+    按账号类型生成实际生效的配置。
+
+    教师账号目前除了"不受夜间限制"之外流程完全一样；
+    万一学校给教师另开了一套门户，只在 config.json 的 teacher 段里填地址即可，
+    不用改代码。
+    """
+    cfg = dict(cfg)
+    if account_type == "teacher":
+        overrides = cfg.get("teacher") or {}
+        for key in ("portal_url", "cas_login_url", "service", "status_url", "wifi_suffix"):
+            value = overrides.get(key)
+            if value:
+                cfg[key] = value
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# 夜间免打扰 + 失败退避（让日志和请求都安静下来）
+# --------------------------------------------------------------------------- #
+def _hhmm_to_minutes(text: str) -> int | None:
+    try:
+        hh, mm = text.split(":")
+        return int(hh) * 60 + int(mm)
+    except (ValueError, AttributeError):
+        return None
+
+
+def in_quiet_hours(cfg: dict, account_type: str = "student",
+                   now: datetime.datetime | None = None) -> bool:
     """
     当前是否处在学校禁止认证的时段（默认周一~周五 00:00-06:00）。
 
-    注意 days 默认 [0,1,2,3,4]（周一~周五）正好对应学生账号的规则 ——
-    因为学生账号**周末是 24 小时可用的**，所以周末本来就不该静默。
-    教师账号（M 开头）在这里被豁免，所有时段都照常检查。
+    教师账号不受这条策略限制，所以 account_type=teacher 时永远返回 False，
+    夜里照常检测、照常自动登录。
     """
-    if quiet_hours_exempt(cfg, account):
+    if account_type == "teacher":
         return False
     quiet = cfg.get("quiet_hours") or {}
     if not quiet.get("enabled"):
@@ -245,21 +492,25 @@ def in_quiet_hours(cfg: dict, now: datetime.datetime | None = None, account: str
 
 
 def note_mode(mode: str, message: str) -> bool:
-    """模式（正常/夜间静默/退避）变化时才写一行日志，避免刷屏。"""
+    """
+    模式（正常/夜间静默/退避/离线/尝试中）变化时才写一行日志，避免刷屏。
+
+    状态没变时连状态文件都不写 —— 15 秒一轮的频率下，每轮都写一次闪存是没必要的。
+    """
     previous = None
     try:
         previous = MODE_FILE.read_text(encoding="utf-8").strip() or None
     except OSError:
         previous = None
+    if previous == mode:
+        return False
     try:
         MODE_FILE.parent.mkdir(exist_ok=True)
         MODE_FILE.write_text(mode, encoding="utf-8")
     except OSError:
         pass
-    if previous != mode:
-        log.info(message)
-        return True
-    return False
+    log.info(message)
+    return True
 
 
 def load_retry() -> dict:
@@ -290,21 +541,55 @@ def backoff_seconds(cfg: dict, failures: int) -> int:
     return int(table[idx])
 
 
-def save_secret(account: str, password: str) -> None:
-    SECRET_FILE.write_text(
-        json.dumps({"account": account, "password": password}), encoding="utf-8"
-    )
+def save_secret(account: str, password: str, account_type: str | None = None) -> None:
+    payload = {"account": account, "password": password}
+    if account_type:
+        payload["account_type"] = account_type
+    SECRET_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     try:
         SECRET_FILE.chmod(0o600)
     except OSError:
         pass
 
 
-def load_secret() -> tuple[str, str]:
+def load_secret() -> dict:
     if not SECRET_FILE.exists():
-        raise SystemExit("还没有保存账号密码，请先运行: python campus_http.py --set-password")
-    obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
-    return obj["account"], obj["password"]
+        raise SystemExit("还没有保存账号密码，请先运行: python3 campus_http.py --set-password")
+    try:
+        obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"读不了 {SECRET_FILE}: {exc}") from exc
+    return {
+        "account": obj["account"],
+        "password": obj["password"],
+        "account_type": normalize_account_type(obj.get("account_type")),
+    }
+
+
+def stored_account_type() -> str | None:
+    """只读 secret.json 里的账号类型，文件不在/没写就当没设置（不报错）。"""
+    try:
+        obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return normalize_account_type(obj.get("account_type"))
+
+
+def save_secret_account_type(account_type: str) -> bool:
+    """只改账号类型，保留原来的账号密码。secret.json 不存在时返回 False。"""
+    if not SECRET_FILE.exists():
+        return False
+    try:
+        obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"读不了 {SECRET_FILE}: {exc}") from exc
+    obj["account_type"] = account_type
+    SECRET_FILE.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    try:
+        SECRET_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return True
 
 
 class Session:
@@ -314,11 +599,21 @@ class Session:
     bind_ip 可选：把请求绑定到指定网卡的源地址发出。
     这样在电脑同时连着有线和无线时，可以让门户以为请求来自无线网段，
     从而在不拔网线、不影响正常连接的前提下调试无线那套流程。
+
+    bind_device 可选：直接把 socket 绑到某张网卡上（Linux 的 SO_BINDTODEVICE）。
+    路由器上两条上行同时在线时，光看目标地址分不清该走哪条，只有绑网卡才可靠 ——
+    校园网是按"终端 IP"认证的，认证请求必须从对应那条线出去才有意义。
     """
 
-    def __init__(self, timeout: int = 8, bind_ip: str | None = None):
+    def __init__(self, timeout: int = 8, bind_ip: str | None = None,
+                 bind_device: str | None = None, route_table: int = 0):
         self.timeout = timeout
         self.bind_ip = bind_ip
+        self.bind_device = bind_device
+        self.route_table = route_table or route_table_for(bind_device or "default")
+        self._resolved_ip: str | None = None
+        self._resolved_at = 0.0
+        self.last_location = ""      # 最近一次响应的 Location，用来判断是不是被门户劫持
         self.jar = http.cookiejar.CookieJar()
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -330,6 +625,30 @@ class Session:
 
     def _cookie_header(self) -> str:
         return "; ".join(f"{c.name}={c.value}" for c in self.jar)
+
+    def _bind_source(self) -> tuple[str, int] | None:
+        """
+        算出这次连接该用的源地址。
+
+        实测（MT7981 + OpenWrt 24.10）：SO_BINDTODEVICE 绑无线网卡会直接
+        "Host is unreachable"，但**按源地址绑定是好的**。所以这里优先把网卡名
+        解析成它当前的 IPv4，用源地址绑；解析不出来才退回绑网卡。
+        DHCP 续约后地址可能变，所以缓存 60 秒就重新解析一次。
+        """
+        if self.bind_ip:
+            return (self.bind_ip, 0)
+        if not self.bind_device:
+            return None
+        now = time.time()
+        if self._resolved_ip and now - self._resolved_at < 60:
+            return (self._resolved_ip, 0)
+        self._resolved_ip = device_ipv4(self.bind_device)
+        self._resolved_at = now
+        if self._resolved_ip:
+            # 光绑源地址没用，还要保证"从这个地址出去的包"查的是专用路由表
+            ensure_source_route(self.bind_device, self._resolved_ip, self.route_table)
+            return (self._resolved_ip, 0)
+        return None
 
     def _store_cookies(self, headers) -> None:
         from http.cookies import SimpleCookie
@@ -348,12 +667,23 @@ class Session:
                 pass
 
     def _request_bound(self, url: str, data: dict | None, ajax: bool, method: str | None):
-        """把请求绑定到指定源地址发出（只支持 http，用于调试无线网段）。"""
+        """把请求绑定到指定源地址 / 指定网卡发出（http 和 https 都支持）。"""
         parts = urllib.parse.urlsplit(url)
-        conn = http.client.HTTPConnection(
-            parts.hostname, parts.port or 80, timeout=self.timeout,
-            source_address=(self.bind_ip, 0),
-        )
+        source = self._bind_source()
+        device = "" if source else (self.bind_device or "")   # 拿到源地址就不用再绑网卡了
+        if parts.scheme == "https":
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE      # 学校证书链不完整时也能用
+            conn = _BoundHTTPSConnection(
+                parts.hostname, parts.port or 443, timeout=self.timeout,
+                context=ctx, source_address=source, device=device,
+            )
+        else:
+            conn = _BoundHTTPConnection(
+                parts.hostname, parts.port or 80, timeout=self.timeout,
+                source_address=source, device=device,
+            )
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -373,6 +703,7 @@ class Session:
             conn.request(method or ("POST" if data is not None else "GET"), path, body=body, headers=headers)
             resp = conn.getresponse()
             self._store_cookies(resp.headers)
+            self.last_location = resp.headers.get("Location") or ""
             return resp.status, resp.read().decode("utf-8", "ignore")
         except Exception as exc:  # noqa: BLE001
             return -1, f"{type(exc).__name__}: {exc}"
@@ -381,7 +712,7 @@ class Session:
 
     def request(self, url: str, data: dict | None = None, ajax: bool = False,
                 method: str | None = None) -> tuple[int, str]:
-        if self.bind_ip and url.startswith("http://"):
+        if self.bind_ip or self.bind_device:
             return self._request_bound(url, data, ajax, method)
         body = None
         headers = {"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9"}
@@ -393,31 +724,159 @@ class Session:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
+                self.last_location = resp.headers.get("Location") or ""
                 return resp.status, resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError as exc:
+            self.last_location = (exc.headers.get("Location") or "") if exc.headers else ""
             return exc.code, exc.read().decode("utf-8", "ignore")
         except Exception as exc:
             return -1, f"{type(exc).__name__}: {exc}"
 
 
 # --------------------------------------------------------------------------- #
+# 能"绑网卡"的 HTTP/HTTPS 连接
+#
+# SO_BINDTODEVICE 必须在 connect() 之前设好，连上之后再设是没用的，
+# 所以要自己建 socket，不能直接用 http.client 默认那套。
+# --------------------------------------------------------------------------- #
+def _create_bound_socket(address, timeout, source_address, device):
+    host, port = address
+    last_error = None
+    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        af, socktype, proto, _canon, sockaddr = res
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if timeout is not None:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            if device:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, device.encode())
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("getaddrinfo 没有返回可用地址")
+
+
+def device_ipv4(device: str) -> str | None:
+    """取某张网卡当前的 IPv4 地址。"""
+    if not device:
+        return None
+    try:
+        out = subprocess.run(["ip", "-4", "addr", "show", "dev", device],
+                             capture_output=True, timeout=5)
+        text = out.stdout.decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", text)
+    return m.group(1) if m else None
+
+
+def route_table_for(name: str) -> int:
+    """按线路名算一个固定的路由表号（100~199），重启后不变。"""
+    return 100 + (sum(ord(ch) for ch in name) % 100)
+
+
+def ensure_source_route(device: str, ip: str, table: int) -> bool:
+    """
+    给"从某个源地址出去的包"单独指定一张路由表。
+
+    为什么必须这么做：Linux 是**按目的地址**选路的，光把 socket 绑到某个源地址
+    并不能改变走哪张网卡。两条上行同时在线时，认证请求会顺着默认路由从有线出去，
+    结果门户看到的是有线那个地址 —— 绑源地址就白绑了（实测就是这样）。
+
+    所以加一条策略路由：来自该地址的包查这张专用表，表里的默认路由指向对应网卡。
+    优先级 500 排在内核 default 之后、mwan3 的 fwmark 规则（1001+）之前。
+    """
+    if not device or not ip:
+        return False
+    try:
+        out = subprocess.run(["ip", "route", "show", "default", "dev", device],
+                             capture_output=True, timeout=5)
+        m = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", out.stdout.decode("utf-8", "ignore"))
+    except Exception:  # noqa: BLE001
+        return False
+    if not m:
+        return False
+    gateway = m.group(1)
+    script = "; ".join([
+        f"ip route replace default via {gateway} dev {device} table {table}",
+        f"ip rule del from {ip} lookup {table} 2>/dev/null",
+        f"ip rule add from {ip} lookup {table} priority 500",
+    ])
+    try:
+        return subprocess.run(["sh", "-c", script], capture_output=True, timeout=5).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _BindDeviceMixin:
+    """
+    注意：http.client 在 __init__ 里会把 self._create_connection 赋成
+    socket.create_connection（实例属性会盖住子类的同名方法），
+    所以必须在 super().__init__() 之后再覆盖回来，只覆写方法是不够的。
+    """
+
+    device = ""
+
+    def _install_device_binding(self, device: str | None) -> None:
+        self.device = device or ""
+        self._create_connection = lambda address, timeout=None, source_address=None: \
+            _create_bound_socket(address, timeout, source_address, self.device)
+
+
+class _BoundHTTPConnection(_BindDeviceMixin, http.client.HTTPConnection):
+    def __init__(self, *args, device: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._install_device_binding(device)
+
+
+class _BoundHTTPSConnection(_BindDeviceMixin, http.client.HTTPSConnection):
+    def __init__(self, *args, device: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._install_device_binding(device)
+
+
+# --------------------------------------------------------------------------- #
 # 在线判断
 # --------------------------------------------------------------------------- #
+# 未认证时校园网会把请求劫持到门户；这些标记出现在页面或跳转地址里就说明没通
+PORTAL_MARKERS = ("Dr.COMWebLogin", "DrcomServer", "eportal", "10.255.255.2")
+
+
+def _looks_online(sess: Session, code: int, text: str) -> bool:
+    """
+    判断这次探测是不是"网络真的通了"。
+
+    认证通过后拿到的是正常响应：可能 200，也可能是 3xx 跳转（百度就回 302 跳 HTTPS）。
+    绑定出口时走的是底层 http.client，它不自动跟随跳转，所以只认 200 会漏判。
+    """
+    if any(marker in text for marker in PORTAL_MARKERS):
+        return False
+    if any(marker in sess.last_location for marker in PORTAL_MARKERS):
+        return False
+    if code == 200:
+        return True
+    return 300 <= code < 400
+
+
 def is_online(sess: Session, cfg: dict, quiet: bool = False) -> bool:
-    # 绑定源地址调试时不能查状态接口（HTTPS 不支持绑定），否则会查到别的网卡的状态
-    if not sess.bind_ip:
-        status, body = sess.request(cfg["status_url"], data={}, ajax=True)
-        if status == 200 and body.strip().startswith("{"):
-            try:
-                if json.loads(body).get("success"):
-                    return True
-            except ValueError:
-                pass
-    else:
-        body = ""
+    status, body = sess.request(cfg["status_url"], data={}, ajax=True)
+    if status == 200 and body.strip().startswith("{"):
+        try:
+            if json.loads(body).get("success"):
+                return True
+        except ValueError:
+            pass
     # 接口不可用或者返回未登录时，用真实访问复核（未认证时会被门户劫持）
     code, text = sess.request(cfg["probe_url"])
-    if code == 200 and "Dr.COMWebLogin" not in text and "DrcomServer" not in text:
+    if _looks_online(sess, code, text):
         return True
     if not quiet:
         log.info("判定为未认证（状态接口返回 %s）", body[:120])
@@ -534,6 +993,13 @@ def _dump(tag: str, text: str) -> None:
         path = LOG_DIR / f"http-{time.strftime('%Y%m%d-%H%M%S')}-{tag}.html"
         path.write_text(text, encoding="utf-8")
         log.info("页面已存档: %s", path.name)
+        # 高频重试时这些存档会飞快堆积，只保留最近的若干份
+        old = sorted(LOG_DIR.glob("http-*.html"), key=lambda p: p.stat().st_mtime)
+        for stale in old[:-DUMP_KEEP]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -541,26 +1007,54 @@ def _dump(tag: str, text: str) -> None:
 # --------------------------------------------------------------------------- #
 # 登录
 # --------------------------------------------------------------------------- #
-def login(sess: Session, cfg: dict, account: str, password: str) -> bool:
-    """入口：先看门户在哪个网段，再决定走哪套登录流程。"""
+def login(sess: Session, cfg: dict, account: str, password: str) -> str:
+    """
+    入口：先看门户在哪个网段，再决定走哪套登录流程。
+
+    返回的是状态字符串而不是 bool，调用方才能决定要不要退避：
+        "ok"       登录成功
+        "offsite"  门户打不开 = 压根不在校园网。这不是失败，不该计入退避
+        "failed"   在校园网但没登上（网络/服务端问题，值得下个周期重试）
+        "fatal"    账号级问题（密码错 / 在线数超限 / 要验证码），重试也没用
+    """
     code, portal_html = sess.request(cfg["portal_url"])
     if code != 200 or not (
         "Dr.COMWebLogin" in portal_html or "eportal" in portal_html or "DrcomServer" in portal_html
     ):
         log.warning("访问不到校园网门户，判定不在校园网，放弃登录（HTTP %s）", code)
-        return False
+        return "offsite"
 
     ip = client_ip_from_portal(portal_html)
-    if needs_cas(ip):
-        log.info("门户判定为有线网段（客户端 %s）→ 走统一身份认证", ip)
-        return cas_login(sess, cfg, account, password)
+    wired = needs_cas(ip)
+    wired_flow = str(cfg.get("wired_flow") or "drcom").lower()
 
-    log.info("门户判定为无线网段（客户端 %s）→ 走 Dr.COM 门户登录", ip)
-    return drcom_login(sess, cfg, portal_html, account, password)
+    if wired and wired_flow == "cas":
+        log.info("有线网段（客户端 %s）→ 按配置走统一身份认证", ip)
+        return "ok" if cas_login(sess, cfg, account, password) else "failed"
+
+    if wired:
+        # 实测（2026-09-16）：Dr.COM 的登录接口并不拒绝有线客户端。
+        # 直接走表单可以绕开统一认证必须做的滑块 / 人脸验证，也不需要 RSA 加密。
+        log.info("有线网段（客户端 %s）→ 优先走 Dr.COM 表单（可绕开统一认证的验证环节）", ip)
+    else:
+        log.info("无线网段（客户端 %s）→ 走 Dr.COM 门户登录", ip)
+
+    result = drcom_login(sess, cfg, portal_html, account, password)
+    if result == "ok":
+        return "ok"
+    if result == "fatal":
+        # 账号级问题（密码错 / 在线数超限 / 要验证码）：换统一认证也一样没用，
+        # 再打请求只会增加账号被锁的风险，所以直接停手。
+        log.error("Dr.COM 登录遇到需要人工处理的提示，本次不再尝试其它登录方式")
+        return "fatal"
+    if wired and wired_flow != "cas":
+        log.info("Dr.COM 方式没有成功，改用统一身份认证再试一次")
+        return "ok" if cas_login(sess, cfg, account, password) else "failed"
+    return "failed"
 
 
 def drcom_login(sess: Session, cfg: dict, portal_html: str,
-                account: str, password: str) -> bool:
+                account: str, password: str) -> str:
     """
     校园无线网段的登录：门户自己的表单，字段是 DDDDD / upass，
     一般没有拼图滑块（配置里 password_cut=0、en_md5=0，密码按明文提交）。
@@ -636,28 +1130,37 @@ def drcom_login(sess: Session, cfg: dict, portal_html: str,
 
             if "验证码" in body:
                 log.error("门户要求图形验证码，纯 HTTP 模式无法自动识别（可改用浏览器模式）")
-                return False
+                return "fatal"
 
             # 提交后给服务器一点时间放行
             deadline = time.time() + 8
             while time.time() < deadline:
                 if is_online(sess, cfg, quiet=True):
                     log.info("登录成功，网络已恢复（服务类型：%s）", form_name)
-                    return True
+                    return "ok"
                 time.sleep(2)
 
             last_error = text
             if endpoint_name == "ACSetting":
                 tried_acsetting = True
-            # 密码错误就没必要再换接口/后缀了，避免触发失败锁定
-            if "密码" in body and "运营商" not in body:
-                log.error("服务器提示密码错误，停止重试以免触发锁定")
-                return False
+
+            # 这几类错误换接口、换服务类型都没用，而且继续试可能把账号撞锁，
+            # 所以立刻停手，并把 AC 的原话写进日志让用户知道到底怎么了。
+            # 注意："账号错误" / "Authentication fail" 不算致命 —— 那往往只是
+            # 服务类型(后缀)选错了，应该继续试下一个。
+            fatal_words = ("密码", "验证码", "在线数超出限制", "Limit Users", "已在线")
+            hit = next((w for w in fatal_words if w in body), "")
+            if hit:
+                log.error("服务器返回需要人工处理的提示 [%s]：%s", hit, text)
+                if hit == "已在线":
+                    log.error("  说明该账号已经有一个会话在线（学校限制并发设备数）。")
+                    log.error("  旧会话在服务端会残留 7~10 分钟才释放，这期间新设备登录会被拒。")
+                return "fatal"
 
         log.info("  接口 %s 未成功，换下一个接口", endpoint_name)
 
     log.error("Dr.COM 门户登录失败，最后一次返回: %s", last_error)
-    return False
+    return "failed"
 
 
 def cas_login(sess: Session, cfg: dict, account: str, password: str) -> bool:
@@ -781,7 +1284,7 @@ def _captcha_endpoints(login_url: str, page: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 命令
 # --------------------------------------------------------------------------- #
-def cmd_set_password() -> None:
+def cmd_set_password(account_type: str | None = None) -> None:
     account = input("校园网账号: ").strip()
     if not account:
         raise SystemExit("账号不能为空")
@@ -789,22 +1292,93 @@ def cmd_set_password() -> None:
     password = getpass.getpass("密码(输入时不显示): ")
     if not password:
         raise SystemExit("密码不能为空")
-    save_secret(account, password)
+    # 没显式指定就沿用已保存的类型，免得"只改个密码"把教师模式重置成学生
+    if not account_type:
+        account_type = stored_account_type()
+    save_secret(account, password, account_type)
     print(f"已保存到 {SECRET_FILE}（建议 chmod 600）")
+    if account_type:
+        print(f"账号类型: {ACCOUNT_TYPE_LABEL[account_type]}（{account_type}）")
+    else:
+        print("账号类型沿用 config.json 的设置（默认学生账号）。")
+        print("教师账号请再执行一次: python3 campus_http.py --mode teacher")
 
 
-def cmd_watch(cfg: dict) -> int:
-    sess = Session(cfg["timeout"])
-    account, password = load_secret()
-    log.info("看门狗启动，每 %s 秒检测一次", cfg["interval"])
+def cmd_set_mode(cfg: dict, value: str | None) -> int:
+    """查看或切换账号类型（student / teacher）。不带参数就是查看。"""
+    if value:
+        account_type = normalize_account_type(value)
+        if not account_type:
+            print("账号类型只能是 student（学生）或 teacher（教师）")
+            return 2
+        if not save_secret_account_type(account_type):
+            print(f"还没有 {SECRET_FILE}，请先运行: python3 campus_http.py --set-password")
+            return 1
+        print(f"账号类型已切换为: {ACCOUNT_TYPE_LABEL[account_type]}（{account_type}）")
+        print("改完记得重启服务: /etc/init.d/campus-net-login restart")
+
+    cred = load_secret()
+    account_type = resolve_account_type(cfg, cred["account_type"], cred["account"])
+    print(f"当前账号: {cred['account']}")
+    print(f"当前账号类型: {ACCOUNT_TYPE_LABEL[account_type]}（{account_type}）")
+    if account_type == "teacher":
+        print("夜间策略: 忽略夜间限制时段，整夜照常检测并自动登录")
+    else:
+        quiet = cfg.get("quiet_hours") or {}
+        if quiet.get("enabled"):
+            print(f"夜间策略: {quiet.get('start', '00:00')}-{quiet.get('end', '06:00')} 暂停尝试"
+                  "（学生账号被学校限制的时段）")
+        else:
+            print("夜间策略: 未启用夜间限制，整夜照常检测")
+    return 0
+
+
+def _watch_one(profile: Profile, bind_ip: str | None = None) -> int:
+    """一条线路的看门狗循环。配了多条线时，每条线在自己的线程里跑这个。"""
+    _current_profile.set(profile)
+    setup_logging(verbose=False, profile=profile)
+    cfg = load_config(profile)
+
+    cred = load_secret()
+    account, password = cred["account"], cred["password"]
+    account_type = resolve_account_type(
+        cfg, cred["account_type"] or profile.default_account_type, account
+    )
+    cfg = apply_account_type(cfg, account_type)
+    sess = Session(cfg["timeout"], bind_ip=bind_ip,
+                   bind_device=profile.device or None)
+
+    interval = max(5, int(cfg["interval"]))
+    # 教师模式默认不做失败退避：网络一恢复就立刻登录，不用干等 2/5/15/30 分钟。
+    # 想变回和学生一样，把 config.json 里的 teacher_backoff 改成 true。
+    use_backoff = account_type != "teacher" or bool(cfg.get("teacher_backoff"))
+    # 但"账号级问题"（密码错 / 已在线 / 要验证码）再怎么重试也没用，还容易把账号
+    # 撞锁，所以教师模式下这类情况仍然给一个固定冷却。设成 0 = 完全不管。
+    fatal_cooldown = int(cfg.get("teacher_fatal_cooldown", 300) or 0) if not use_backoff else 0
+
+    log.info("看门狗启动，每 %s 秒检测一次", interval)
+    log.info("线路 %s：出口 %s，账号 %s（%s）",
+             profile.name, profile.device or "按系统路由",
+             account, ACCOUNT_TYPE_LABEL[account_type])
+    if account_type == "teacher":
+        log.info("教师账号模式：忽略夜间限制时段；在线时保持静默，不做状态刷屏")
+        if use_backoff:
+            log.info("  登录失败仍按 failure_backoff 退避（teacher_backoff=true）")
+        elif fatal_cooldown:
+            log.info("  登录失败不退避，每个周期都重试；账号级问题冷却 %s 秒", fatal_cooldown)
+        else:
+            log.info("  登录失败不退避，每个周期都重试")
+
     while True:
+        started = time.time()
         try:
-            if in_quiet_hours(cfg, account=account):
+            if in_quiet_hours(cfg, account_type):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段({quiet.get('start','00:00')}-{quiet.get('end','06:00')})，"
                                    "学校此时不允许学生账号认证，暂停尝试")
                 time.sleep(300)
                 continue
+
             if is_online(sess, cfg, quiet=True):
                 clear_retry()
                 note_mode("normal", "网络已恢复，回到常规检查")
@@ -812,24 +1386,103 @@ def cmd_watch(cfg: dict) -> int:
                 retry = load_retry()
                 next_attempt = float(retry.get("next_attempt", 0) or 0)
                 if next_attempt > time.time():
-                    minutes = int((next_attempt - time.time()) // 60) + 1
+                    wait = int(next_attempt - time.time()) + 1
+                    span = f"{wait // 60} 分钟" if wait >= 60 else f"{wait} 秒"
                     note_mode(f"backoff-{int(next_attempt)}",
-                              f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                              f"{retry.get('reason') or '上次登录失败'}，{span}后再试")
+                elif not portal_ok(sess, cfg):
+                    # 门户都打不开 = 压根不在校园网（网线没插 / 上游断了 / 学校断网）。
+                    # 这不算"登录失败"，不能计入退避，否则等网络恢复后还要白等
+                    # 最多 30 分钟才去尝试。cmd_login 早就有这个判断，cmd_watch 漏了。
+                    clear_retry()
+                    note_mode("normal", "不在校园网环境（门户不可达），跳过本次尝试")
                 else:
-                    note_mode("normal", "恢复正常检查，开始尝试登录")
-                    if not login(sess, cfg, account, password):
+                    note_mode("login", "检测到未认证，开始尝试登录")
+                    result = login(sess, cfg, account, password)
+                    if result == "ok":
+                        clear_retry()
+                    elif result == "offsite":
+                        clear_retry()
+                        note_mode("normal", "不在校园网环境（门户不可达），跳过本次尝试")
+                    elif not use_backoff and result != "fatal":
+                        # 教师模式：普通失败不退避，下个周期马上再试。
+                        # 保持静默（note_mode 状态没变就不写日志），细节看 login() 自己的记录。
+                        clear_retry()
+                    elif not use_backoff and fatal_cooldown > 0:
+                        save_retry({"failures": int(retry.get("failures", 0)) + 1,
+                                    "next_attempt": time.time() + fatal_cooldown,
+                                    "reason": "账号级问题（需要人工处理）"})
+                    else:
                         failures = int(retry.get("failures", 0)) + 1
                         delay = backoff_seconds(cfg, failures)
-                        save_retry({"failures": failures, "next_attempt": time.time() + delay})
+                        save_retry({"failures": failures, "next_attempt": time.time() + delay,
+                                    "reason": f"上次登录失败（累计 {failures} 次）"})
                         log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
-                    else:
-                        clear_retry()
         except Exception as exc:
             log.exception("循环异常: %s", exc)
-        time.sleep(int(cfg["interval"]))
+        # 让"每 N 秒检测一次"名副其实：扣掉这次检测本身花掉的时间
+        time.sleep(max(1.0, interval - (time.time() - started)))
 
 
-def cmd_login(cfg: dict) -> int:
+def _watch_thread(profile: Profile, bind_ip: str | None) -> None:
+    """线程入口：把异常记下来，别让一条线挂了带崩整个进程。"""
+    try:
+        _watch_one(profile, bind_ip)
+    except BaseException:  # noqa: BLE001
+        _current_profile.set(profile)
+        try:
+            setup_logging(verbose=False, profile=profile)
+            log.exception("线路 %s 的看门狗异常退出", profile.name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def cmd_watch(cfg: dict | None = None, bind_ip: str | None = None) -> int:
+    """
+    看门狗入口。
+
+    只有一条线时就在当前线程里跑（和以前完全一样）；
+    配了多条线时，在同一个进程里给每条线开一个线程 —— 这样只占一份解释器内存，
+    而且两条线互不阻塞（一条在登录时，另一条照常检查）。
+    """
+    profiles = load_profiles()
+    if len(profiles) == 1:
+        return _watch_one(profiles[0], bind_ip)
+
+    setup_logging(verbose=False, profile=profiles[0])
+    profiles[0].log.info("检测到 %s 条线路，在同一个进程里并行看护：%s",
+                         len(profiles), _profile_names(profiles))
+    threads = []
+    for p in profiles:
+        t = threading.Thread(target=_watch_thread, args=(p, bind_ip),
+                             name=p.name, daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return 0
+
+
+def _login_one(profile: Profile, bind_ip: str | None = None) -> int:
+    _current_profile.set(profile)
+    setup_logging(verbose=False, profile=profile)
+    cfg = load_config(profile)
+    return _login_with(cfg, bind_ip, profile)
+
+
+def cmd_login(cfg: dict | None = None, bind_ip: str | None = None) -> int:
+    """执行一次登录。配了多条线时逐条来。"""
+    profiles = load_profiles()
+    if len(profiles) == 1:
+        return _login_one(profiles[0], bind_ip)
+    rc = 0
+    for p in profiles:
+        rc |= _login_one(p, bind_ip)
+    return rc
+
+
+def _login_with(cfg: dict, bind_ip: str | None = None,
+                profile: Profile | None = None) -> int:
     """
     执行一次登录。
 
@@ -839,10 +1492,17 @@ def cmd_login(cfg: dict) -> int:
       3. 登录失败后按 2/5/15/30 分钟退避，避免每分钟都去撞墙
     每种情况只在"状态变化"时写一行日志。
     """
-    sess = Session(cfg["timeout"])
+    sess = Session(cfg["timeout"], bind_ip=bind_ip,
+                   bind_device=(profile.device or None) if profile else None)
     now_ts = time.time()
 
-    if in_quiet_hours(cfg, account=saved_account()):
+    account_type = resolve_account_type(
+        cfg, stored_account_type() or (profile.default_account_type if profile else ""),
+        stored_account()
+    )
+    cfg = apply_account_type(cfg, account_type)
+
+    if in_quiet_hours(cfg, account_type):
         quiet = cfg.get("quiet_hours") or {}
         note_mode("quiet", f"进入夜间限制时段（{quiet.get('start', '00:00')}-{quiet.get('end', '06:00')}），"
                            "学校此时不允许学生账号认证，暂停尝试")
@@ -854,28 +1514,58 @@ def cmd_login(cfg: dict) -> int:
         return 0
 
     if not portal_ok(sess, cfg):
-        note_mode("normal", "不在校园网环境，跳过")
+        clear_retry()
+        note_mode("offsite", "不在校园网环境（门户不可达），跳过本次尝试")
         return 0
 
     retry = load_retry()
     next_attempt = float(retry.get("next_attempt", 0) or 0)
     if next_attempt > now_ts:
-        minutes = int((next_attempt - now_ts) // 60) + 1
+        wait = int(next_attempt - now_ts) + 1
+        span = f"{wait // 60} 分钟" if wait >= 60 else f"{wait} 秒"
         note_mode(f"backoff-{int(next_attempt)}",
-                  f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                  f"{retry.get('reason') or '上次登录失败'}，{span}后再试")
         return 0
 
-    note_mode("normal", "恢复正常检查，开始尝试登录")
-    account, password = load_secret()
-    if login(sess, cfg, account, password):
+    note_mode("login", "检测到未认证，开始尝试登录")
+    cred = load_secret()
+    result = login(sess, cfg, cred["account"], cred["password"])
+    if result == "ok":
         clear_retry()
+        return 0
+    if result == "offsite":
+        clear_retry()
+        note_mode("offsite", "不在校园网环境（门户不可达），跳过本次尝试")
         return 0
 
     failures = int(retry.get("failures", 0)) + 1
     delay = backoff_seconds(cfg, failures)
-    save_retry({"failures": failures, "next_attempt": now_ts + delay})
+    save_retry({"failures": failures, "next_attempt": now_ts + delay,
+                "reason": f"上次登录失败（累计 {failures} 次）"})
     log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
     return 1
+
+
+def _do_probe(sess: Session, cfg: dict) -> None:
+    """探测门户走哪套流程（只读，不登录）。"""
+    code, html = sess.request(cfg["portal_url"])
+    ip = client_ip_from_portal(html)
+    log.info("门户 HTTP %s，页面 %s 字节", code, len(html))
+    log.info("门户看到的客户端地址: %s", ip)
+    wired_flow = str(cfg.get("wired_flow") or "drcom").lower()
+    if not needs_cas(ip):
+        flow = "无线网段 → Dr.COM 门户登录"
+    elif wired_flow == "cas":
+        flow = "有线网段 → 统一身份认证 + 拼图滑块（config.json 里强制指定）"
+    else:
+        flow = "有线网段 → 先 Dr.COM 表单，失败再回退统一身份认证"
+    account_type = resolve_account_type(cfg, stored_account_type(), stored_account())
+    log.info("应该走: %s", flow)
+    log.info("账号类型: %s", ACCOUNT_TYPE_LABEL[account_type])
+    conf = parse_portal_config(html)
+    for k in sorted(conf):
+        log.info("  门户配置 %s = %s", k, conf[k])
+    log.info("当前是否已在线: %s", is_online(sess, cfg, quiet=True))
 
 
 def main() -> int:
@@ -884,7 +1574,13 @@ def main() -> int:
     parser.add_argument("--login", action="store_true", help="执行一次登录")
     parser.add_argument("--watch", action="store_true", help="常驻看门狗")
     parser.add_argument("--set-password", action="store_true", help="保存账号密码")
+    parser.add_argument("--mode", "--account-type", dest="mode", nargs="?", const="",
+                        default=None, metavar="{student,teacher}",
+                        help="查看/切换账号类型：student=学生账号，"
+                             "teacher=教师账号（不受夜间限制，整夜也会自动登录）")
     parser.add_argument("--probe", action="store_true", help="探测门户走的是哪套登录流程（不登录）")
+    parser.add_argument("--profile", metavar="名字",
+                        help="只操作指定线路（config.json 里配了多条线时用）")
     parser.add_argument("--quiet", action="store_true", help="不输出到控制台")
     args = parser.parse_args()
 
@@ -894,33 +1590,49 @@ def main() -> int:
     except Exception:
         pass
 
-    setup_logging(verbose=not args.quiet)
-    cfg = load_config()
-
     try:
+        # --set-password / --mode 要写某条线的文件，所以得先定下是哪条线
         if args.set_password:
-            cmd_set_password()
+            prof = resolve_profile(args.profile)
+            _current_profile.set(prof)
+            setup_logging(verbose=True, profile=prof)
+            cmd_set_password(normalize_account_type(args.mode))
             return 0
-        sess = Session(cfg["timeout"])
-        if args.probe:
-            code, html = sess.request(cfg["portal_url"])
-            ip = client_ip_from_portal(html)
-            log.info("门户 HTTP %s，页面 %s 字节", code, len(html))
-            log.info("门户看到的客户端地址: %s", ip)
-            log.info("应该走: %s", "统一身份认证(有滑块)" if needs_cas(ip) else "Dr.COM 门户登录(无线)")
-            conf = parse_portal_config(html)
-            for k in sorted(conf):
-                log.info("  门户配置 %s = %s", k, conf[k])
-            log.info("当前是否已在线: %s", is_online(sess, cfg, quiet=True))
-            return 0
-        if args.check:
-            online = is_online(sess, cfg)
-            log.info("当前状态: %s", "已在线" if online else "未认证/已断网")
-            return 0 if online else 1
+        if args.mode is not None:
+            prof = resolve_profile(args.profile)
+            _current_profile.set(prof)
+            setup_logging(verbose=True, profile=prof)
+            return cmd_set_mode(load_config(prof), args.mode or None)
         if args.watch:
-            return cmd_watch(cfg)
+            return cmd_watch()
         if args.login:
-            return cmd_login(cfg)
+            return cmd_login()
+        if not (args.probe or args.check):
+            parser.print_help()
+            return 0
+
+        # --probe / --check：默认把所有线路都过一遍
+        profiles = load_profiles()
+        if args.profile:
+            profiles = [resolve_profile(args.profile)]
+        rc = 0
+        for prof in profiles:
+            _current_profile.set(prof)
+            setup_logging(verbose=not args.quiet, profile=prof)
+            pcfg = load_config(prof)
+            sess = Session(pcfg["timeout"], bind_device=prof.device or None)
+            if args.probe:
+                _do_probe(sess, pcfg)
+                continue
+            account_type = resolve_account_type(
+                pcfg, stored_account_type() or prof.default_account_type, stored_account()
+            )
+            online = is_online(sess, pcfg)
+            log.info("当前状态: %s", "已在线" if online else "未认证/已断网")
+            log.info("账号类型: %s", ACCOUNT_TYPE_LABEL[account_type])
+            if not online:
+                rc = 1
+        return rc
     except SystemExit:
         raise
     except Exception:
