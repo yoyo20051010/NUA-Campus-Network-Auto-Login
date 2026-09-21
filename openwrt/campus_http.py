@@ -39,6 +39,7 @@ import http.cookiejar
 import json
 import logging
 import logging.handlers
+import os
 import pathlib
 import re
 import socket
@@ -181,6 +182,13 @@ DEFAULT_CONFIG = {
         "end": "06:00",
         "days": [0, 1, 2, 3, 4],
     },
+    # 夜间限制时段开始前多少分钟，就提前把这条线摘出备用池（0 = 不提前）。
+    # 学校是整点断网，等断了再切的话，正在跑的连接会直接断；提前几分钟切走，
+    # 现有连接能在原线路上跑完、新连接直接走备用线，用户基本无感。
+    "pre_switch_minutes": 5,
+    # 常驻内存上限（MB）：超过就主动退出让 procd 重启，避免被内核 OOM 杀掉。
+    # 设 0 = 不检查。
+    "max_rss_mb": 60,
     # 登录失败后的退避秒数：依次 2 分钟、5 分钟、15 分钟、30 分钟（之后一直 30 分钟）
     "failure_backoff": [120, 300, 900, 1800],
     # 教师账号专用覆盖项：留空 = 和其它账号完全一样。
@@ -491,6 +499,25 @@ def in_quiet_hours(cfg: dict, account_type: str = "student",
     if start <= end:
         return start <= current < end
     return current >= start or current < end       # 跨天的情况
+
+
+def in_pre_quiet(cfg: dict, account_type: str, lead_minutes: int,
+                 now: datetime.datetime | None = None) -> bool:
+    """
+    是否处在「夜间限制时段开始前 lead_minutes 分钟以内」。
+
+    用来**提前**把整条线摘出备用池。学校是整点断网，等到那一刻才发现就已经晚了
+    —— 正在跑的连接会直接断。提前几分钟切走：现有连接还能在原线路上跑完，
+    新连接直接走备用线，用户基本无感。
+
+    教师账号不受夜间限制，永远返回 False。
+    """
+    if account_type == "teacher" or lead_minutes <= 0:
+        return False
+    now = now or datetime.datetime.now()
+    if in_quiet_hours(cfg, account_type, now):
+        return False
+    return in_quiet_hours(cfg, account_type, now + datetime.timedelta(minutes=lead_minutes))
 
 
 def note_mode(mode: str, message: str) -> bool:
@@ -816,6 +843,40 @@ def ensure_source_route(device: str, ip: str, table: int) -> bool:
         return subprocess.run(["sh", "-c", script], capture_output=True, timeout=5).returncode == 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def self_rss_mb() -> float:
+    """读自己的常驻内存（MB）。取不到返回 0。"""
+    try:
+        for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def check_memory(cfg: dict) -> None:
+    """
+    自己盯着点内存：占用超过阈值就主动退出，让 procd 把服务重新拉起来。
+
+    为什么需要这样：实测这个脚本的常驻内存会缓慢增长（约 1MB/小时 ——
+    21 小时从 28MB 涨到 48MB）。路由器内存本来就小（233MB，还要跑 mwan3、
+    dnsmasq、WiFi 等），涨到一定程度会触发内核 OOM。之前就发生过一次：
+    脚本被 OOM 杀掉，而且前后 mwan3 的跟踪进程还卡死过，导致主备切换失效。
+
+    主动重启比被 OOM 杀掉可控得多：日志里有明确记录，中断只有一两秒，
+    起来后立刻恢复检查。阈值用 config.json 的 max_rss_mb 调，设 0 = 不检查。
+    """
+    limit = int(cfg.get("max_rss_mb", 60) or 0)
+    if limit <= 0:
+        return
+    rss = self_rss_mb()
+    if rss and rss > limit:
+        log.warning("常驻内存已到 %.1f MB（上限 %s MB），主动退出让服务重新拉起来",
+                    rss, limit)
+        logging.shutdown()      # 先把日志刷出去
+        os._exit(0)             # 整个进程退出；procd 的 respawn 会立刻重启
 
 
 def sync_mwan3(profile: "Profile", online: bool) -> None:
@@ -1419,6 +1480,20 @@ def _watch_one(profile: Profile, bind_ip: str | None = None) -> int:
     while True:
         started = time.time()
         try:
+            # 占用太高就自己重启（procd 会拉起来），别等到被内核 OOM 杀掉
+            check_memory(cfg)
+
+            # 学校是"到点断网"，等断了再切就已经晚了（正在跑的连接会断）。
+            # 所以提前几分钟就把这条线摘出备用池，让流量在断网前先走开。
+            lead = int(cfg.get("pre_switch_minutes", 5) or 0)
+            if lead and in_pre_quiet(cfg, account_type, lead):
+                sync_mwan3(profile, False)
+                note_mode("pre-quiet",
+                          f"距夜间限制时段不到 {lead} 分钟，提前把这条线摘出备用池，"
+                          "避免到点断网时的卡顿")
+                time.sleep(60)
+                continue
+
             if in_quiet_hours(cfg, account_type):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段({quiet.get('start','00:00')}-{quiet.get('end','06:00')})，"
