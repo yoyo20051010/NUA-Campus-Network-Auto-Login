@@ -153,9 +153,15 @@ python campus_http.py --probe --bind wifi
 │   ├── campus-net-login.init
 │   ├── campus_http.py
 │   └── README.md
+├── openwrt-cpp/           路由器版的 C++ 重写（常驻内存 0.5MB，原版是 28~48MB）
+│   ├── src/               源码
+│   ├── tests/             单元测试（含与 Python 版逐字节对照的 RSA 向量）
+│   ├── tools/build.ps1    用 zig 交叉编译成 aarch64 静态二进制
+│   └── README.md
 ├── docs/
 │   ├── 技术细节.md        认证流程、加密算法、调试方法
-│   └── 实测结论与经验教训.md  限速规律、会话限制、多线路实测数据（含桌面端改动清单）
+│   ├── 实测结论与经验教训.md  限速规律、会话限制、多线路实测数据（含桌面端改动清单）
+│   └── openwrt-cpp.md     C++ 重写的验证记录与经验教训
 └── tools/                 开发/调试工具（不影响日常使用）
     ├── make_release.ps1   打包安装包（含自带运行环境）
     ├── selftest_*.py      自测（加密实现比对、表单识别、滑块拖拽）

@@ -1,0 +1,46 @@
+{
+  "_说明": "由 gen_rsa_vectors.py 从 Python 参考实现算出，勿手工修改",
+  "chunk_size": 126,
+  "samples": [
+    {
+      "password": "a",
+      "cipher": "325329102024a64bf54c9eb4fda3746acbf15ee7f6831a7a6d9a603d2e2f434bf3b292ac9280e731ba8837f2fdbfedaa1187b7bd8fb3d6931c94c0422a5e57bb78dbc00bf67794fd42fa34ec47c2972e4bd3a2048c0c7010cd090c94d8089e9759390883985c3b0e3982042f5ab961229464f7b51cbbc8f1a73b493a30a82644"
+    },
+    {
+      "password": "123456",
+      "cipher": "48fec396118db1fa3438c1298c84d4963142b636e6867b7911e2d11b14e88a84954072d7823e30cca79649abe557251541ac2fddbb2c70a0bd26f172043255271e9cf3a8b7d7e06843de3b23e71595cbe1478cb5d3831e5f8f35669f5fb8e3a6a543f302df16367f909c7607cb7535b62ed3c6b5a2adbb257e53ffc9fab751a4"
+    },
+    {
+      "password": "password",
+      "cipher": "02f2d5c1e1aa86bba9159d1e653ce6cb709cc7ddb4160285a29dfe63b44ced1abfa5c8c58e06b9bfa525ac0c49ab230572878b25d09ba2ec69918762d807dd5eafd64953ad7b65c6f702c446378bcafa49dac9e7272f6775a5efb6b84885d1b946669c41388b5dd89c93e2dc70d21a37522dbb7590bddfb078b97e6255ec82da"
+    },
+    {
+      "password": "914520",
+      "cipher": "3a009d62bbe20ba8a46212042e48cf4dc061f0791bb8acfc543b41a6bf218903006fa1ff0a3d13f906090993a601c36d03da6acdb041d9fe35e2a7102ae78b3e00ac05373542b1db8640374733166680ee145d8764af2c18ece2619e96f8e041fcee68c26106ace4f67b59f3e9d62682d4526c9a8e5477aad0b4c8f7c861510c"
+    },
+    {
+      "password": "Abc123!@#",
+      "cipher": "215112b2212dc535708a0cd566e8548cdd1e55d7b3cdccb5655ca393d393a670a2f4c8f974e5b77030949f282bef90a5a7de10ffa1129b7e298bf4fedea191d3e1f697415891ef4a0b15c6c2898b9468094f407971e09b3b7b49a59f01be79809d7ce69f6080b69b67ac33494ba3dfd05c2fa24757455b54643f29783dd259d0"
+    },
+    {
+      "password": "0123456789abcdef",
+      "cipher": "1fd8eaa386721c676d4922b8f82dd57bf83d55a9bd2e1166b153bbbeef24531aa979ac13920dbb6d987a5e20cd1b9706158f190eb6e83398c6cedffcff816526af81e576cd01844cbcb0a04a66645a46266715caed10729b949861c47b70b79c2271962d2a55e4e6718816220b017d4f5c90a512983daeadb6fd7ecb03008dcc"
+    },
+    {
+      "password": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "cipher": "057a796fbae4b2e0862abf4ac9fc88436733f3e323aba7b679dbd4752015eeb13a900a05e7330bd54fab1d078440efd3eda0129d237c80011d33ded9f1d5df1c047e925ecfe4ce298443f609ff8825a3c86f2061d7107b1bf745662743a6cf9b749dae0b2c3a600f58680cc61b14f25c0baee54e9642d7e16e99c2693dec9cee"
+    },
+    {
+      "password": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "cipher": "8676afa1b75eb8faf7cee97980a40672ac1053c6fb735c3a9dff5bd6850ec7541824fe01293e98792984c367d210c35c32b116529a6384aaaacf63fd99b3c8882a9293ccb56e8a1c0994fc601969da1e29afc308704a748be0dbbff9b41dc5dfe95385c1da9a4cb8b38286429ca6267791a9fffb9bae94f369f28abf0ef76125 0055f0bb426020d9925511154974c80a4ca9b318434fc28b5e9b77702ef4733f12e098e2863af96d2157bd9d5c6dab8d025ceb8c139c0c8d28018a73759fe2020f843f93b8b815902c942ea378210a68201eb2286232b0fd7f98fbb636cad33fb6cff6fe4d7afc658dd30c45b8f16711048a94e217ba8031124c30b75a7ea2f1"
+    },
+    {
+      "password": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "cipher": "170b34bc392fe34d55a43bcc1e8f9fbcd9b85edec076b98096f30350b35017b942616ed931dd6dbd603dcbbca5ccaa2e8f388e69454ce7f4dbcb0daa457b5f99adbd36c5a7440cf61f2406e4bd876dfcf9b658e68590d1e132e099aeb454b3be7bd8a7d519c8e986404f9ffa04491250bd526ab6ff9dc69676e14a04c3260a91 170b34bc392fe34d55a43bcc1e8f9fbcd9b85edec076b98096f30350b35017b942616ed931dd6dbd603dcbbca5ccaa2e8f388e69454ce7f4dbcb0daa457b5f99adbd36c5a7440cf61f2406e4bd876dfcf9b658e68590d1e132e099aeb454b3be7bd8a7d519c8e986404f9ffa04491250bd526ab6ff9dc69676e14a04c3260a91"
+    },
+    {
+      "password": "~!@#$%^&*()_+-=[]{}|;:',.<>/?`",
+      "cipher": "6af5df645cd656a6c74fe23f6871633f70173d78ff4893048a3c5bd45b58c325039b0aab46e65def2977a9b375137095acd3879b835b4627fbd30775676c673c6591a72d11e6454659cfd85ada49be5066839b866cc07cd3e80ddc2bf0c1fa5068ec995d27aede78bbdc5f034800167b24ebf511f0dd1d822d6e8fe471f3aa93"
+    }
+  ]
+}

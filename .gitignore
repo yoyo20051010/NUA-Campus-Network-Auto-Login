@@ -16,6 +16,10 @@ __pycache__/
 *.zip
 runtime/
 
+# ---- 交叉编译工具链与构建产物（体积大，不入库）----
+.toolchain/
+openwrt-cpp/build/
+
 # ---- 编辑器/系统 ----
 .vscode/
 .idea/
