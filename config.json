@@ -20,7 +20,7 @@
   ],
   "require_campus_ip": false,
   "portal_timeout": 5,
-  "interval": 30,
+  "interval": 15,
   "headless": true,
   "login_timeout": 180,
   "_quiet_hours说明": "夜间限制时段：这段时间学校不允许学生账号认证，脚本不尝试登录、也不发任何网络请求，只在进入时记一行日志。days 用 0=周一 … 6=周日。默认周一~周五 00:00-06:00（覆盖'周日到周四晚上断网'的常见策略）。想每天都有这个时段就把 days 删掉；想关掉整个功能就把 enabled 改成 false。",
@@ -41,13 +41,18 @@
     "M"
   ],
   "quiet_hours_exempt_accounts": [],
-  "_failure_backoff说明": "登录失败后的重试间隔（秒），依次取用；超出后一直用最后一个值。默认 2/5/15/30 分钟。",
+  "_failure_backoff说明": "登录失败后的重试间隔（秒），依次取用；超出后一直用最后一个值。默认 30/60 秒（最长 60 秒）。",
   "failure_backoff": [
-    120,
-    300,
-    900,
-    1800
+    30,
+    60
   ],
   "_wired_flow说明": "有线网段用哪套登录：drcom=直接走 Dr.COM 表单（默认，实测可行，能绕开统一认证的拼图滑块/人脸识别，也不需要 RSA）；cas=强制走统一身份认证；auto=同 drcom。两种都失败时会自动用另一套再试一次。",
-  "wired_flow": "drcom"
+  "wired_flow": "drcom",
+  "_notify说明": "连续失败达到这么多次后，弹一次 Windows 通知提醒（密码改了/账号被别的设备占满时很有用）。0 = 不弹。",
+  "notify_after_failures": 3,
+  "_日志与存档说明": "日志轮转和失败存档的保留策略：log_max_kb=单个日志文件上限(KB，0=不轮转)、log_backups=保留几份历史日志、page_dump_keep=失败时存档的页面(http-*.html)留几份、screenshot_keep=浏览器模式的截图留几张。",
+  "log_max_kb": 1024,
+  "log_backups": 3,
+  "page_dump_keep": 30,
+  "screenshot_keep": 30
 }

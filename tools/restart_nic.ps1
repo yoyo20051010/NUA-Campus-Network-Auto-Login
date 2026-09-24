@@ -162,6 +162,8 @@ $useHttpTest = ($AutoLogin -and $Engine -eq 'http')
 if ($useHttpTest) {
     Write-Step "临时停用计划任务（测完自动恢复；否则浏览器版会抢先登录）"
     schtasks /Change /TN $TaskName /DISABLE 2>&1 | Out-Null
+    # 计划任务跑的是常驻看门狗，只 /DISABLE 停不掉已经在跑的进程
+    schtasks /End /TN $TaskName 2>&1 | Out-Null
 }
 
 try {
@@ -238,8 +240,10 @@ try {
 }
 finally {
     if ($useHttpTest) {
-        Write-Step "恢复计划任务（若纯 HTTP 失败，浏览器版会在 1 分钟内兜底恢复网络）"
+        Write-Step "恢复计划任务（若纯 HTTP 失败，浏览器版会在 15 秒内兜底恢复网络）"
         schtasks /Change /TN $TaskName /ENABLE 2>&1 | Out-Null
+        # 常驻看门狗刚被 /End 结束了，马上补跑一次，别等到下一个 15 秒才恢复
+        schtasks /Run /TN $TaskName 2>&1 | Out-Null
     }
     # 双保险：确保网卡是启用的
     try {

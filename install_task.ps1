@@ -18,9 +18,11 @@ $TaskName = 'CampusNetAutoLogin'
 if ($Engine -eq 'http') {
     $Script = Join-Path $AppDir 'campus_http.py'
     $Secret = Join-Path $AppDir 'secret.json'
+    $LogName = 'campus_http.log'
 } else {
     $Script = Join-Path $AppDir 'campus_login.py'
     $Secret = Join-Path $AppDir 'secret.bin'
+    $LogName = 'campus_login.log'
 }
 
 if (-not (Test-Path $Script)) {
@@ -44,7 +46,11 @@ if (Test-Path $BundledPythonW) {
 
 $UserSid    = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $StartTime  = (Get-Date).AddMinutes(1).ToString('yyyy-MM-ddTHH:mm:ss')
-$Arguments  = '"' + $Script + '" --login --quiet'
+# --watch = 常驻看门狗：登录后启动一次，之后在同一个进程里每 15 秒检查一次。
+# 配合下面的 MultipleInstancesPolicy=IgnoreNew，任务每 15 秒的重复触发不会
+# 再拉起新进程（省掉每 15 秒启动一次 Python 的开销），但进程万一挂了，
+# 15 秒内就会被重新拉起。
+$Arguments  = '"' + $Script + '" --watch --quiet'
 
 $Xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -56,13 +62,13 @@ $Xml = @"
     <LogonTrigger>
       <Enabled>true</Enabled>
       <UserId>$UserSid</UserId>
-      <Delay>PT20S</Delay>
+      <Delay>PT8S</Delay>
     </LogonTrigger>
     <TimeTrigger>
       <StartBoundary>$StartTime</StartBoundary>
       <Enabled>true</Enabled>
       <Repetition>
-        <Interval>PT1M</Interval>
+        <Interval>PT15S</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
     </TimeTrigger>
@@ -111,10 +117,21 @@ $code = $LASTEXITCODE
 Remove-Item $XmlPath -Force -ErrorAction SilentlyContinue
 if ($code -ne 0) { throw "创建计划任务失败" }
 
+# 建完再查一次：不要只凭"命令没报错"就跟用户说装好了
+$prevPref = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$query = (schtasks /Query /TN $TaskName /V /FO CSV 2>&1 | Out-String)
+$queryCode = $LASTEXITCODE
+$ErrorActionPreference = $prevPref
+if ($queryCode -ne 0 -or $query -notmatch [regex]::Escape($TaskName)) {
+    throw "计划任务没有真正注册成功，请手动检查：`n$query"
+}
+
 Write-Host ""
 Write-Host "已安装计划任务: $TaskName" -ForegroundColor Green
-Write-Host "  - 登录 Windows 20 秒后首次执行, 之后每 1 分钟检查一次"
+Write-Host "  - 登录 Windows 8 秒后启动, 之后每 15 秒检查一次（已验证注册成功）"
+Write-Host "  - 常驻后台: 进程万一挂了, 15 秒内会被任务重新拉起"
 Write-Host "  - 电池供电时照常运行; 已在运行时不会重复启动"
-Write-Host "  - 日志: $AppDir\logs\campus_login.log"
+Write-Host "  - 日志: $AppDir\logs\$LogName"
 Write-Host "  - 立即试跑: schtasks /Run /TN $TaskName"
 Write-Host "  - 查看状态: schtasks /Query /TN $TaskName /V /FO LIST"

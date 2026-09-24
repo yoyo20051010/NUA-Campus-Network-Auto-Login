@@ -64,7 +64,7 @@ Title "校园网自动登录 · 安装向导"
 Say "【这个程序是干什么的】" 'White'
 Say "  · 开机（或重新联网）后自动帮你完成校园网登录"
 Say "  · 不用再手动打开网页、输账号密码、拖滑块"
-Say "  · 掉线后 1 分钟内自动重连"
+Say "  · 掉线后 15 秒内自动重连"
 Write-Host ""
 
 Say "【它什么时候才会动手】" 'White'
@@ -184,7 +184,7 @@ Say "顺手检测一下当前网络状态："
 # --------------------------------------------------------------------------- #
 Title "第 4 步 / 共 4 步：设置开机自启"
 
-Say "开启后，每次登录 Windows 会自动检查一次，之后每分钟检查一次，"
+Say "开启后，登录 Windows 8 秒后会启动一个后台进程，之后每 15 秒检查一次，"
 Say "发现掉线就自动重连。它只在校园网环境下动作，不会影响其他网络。"
 Write-Host ""
 
@@ -196,7 +196,7 @@ if (-not $Yes) {
 if ($wantAuto) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $AppDir 'install_task.ps1') -Engine $Engine
     if ($LASTEXITCODE -eq 0) {
-        Say "已开启开机自动运行（登录 Windows 20 秒后首次执行）。" 'Green'
+        Say "已开启开机自动运行（登录 Windows 8 秒后启动，任务已确认注册成功）。" 'Green'
     } else {
         Say "自启设置失败，可以稍后手动运行 install_task.ps1。" 'Yellow'
     }
@@ -220,5 +220,5 @@ Say "开机自启：$(if ($wantAuto) { '已开启' } else { '未开启' })"
 Say "运行日志：$AppDir\logs\"
 Say "想卸载：双击「卸载.bat」"
 Write-Host ""
-Say "小提示：如果校园网在晚上 12 点断网，脚本会在断网后 1 分钟内自动重连；" 'DarkGray'
+Say "小提示：如果校园网在晚上 12 点断网，脚本会在断网后 15 秒内自动重连；" 'DarkGray'
 Say "但学生账号能否在夜里重新认证由学校策略决定，脚本本身无法改变。" 'DarkGray'

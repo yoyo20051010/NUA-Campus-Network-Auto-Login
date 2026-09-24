@@ -3,15 +3,16 @@
 **南京艺术学院校园网自动登录工具** · 开机自动联网，掉线自动重连，不用再手动点登录、拖滑块。
 
 > Automatic campus network login for Nanjing University of the Arts (NUA).
-> Logs in on boot, reconnects within a minute after a drop, and never touches
-> other networks. Works on Windows; an OpenWrt router build is included too.
+> Logs in 8 seconds after boot, reconnects within 15 seconds after a drop, and
+> never touches other networks. Runs on Windows 10/11 (64-bit); an OpenWrt
+> router build is included too.
 
 ---
 
 ## 它能做什么
 
-- **开机自动登录**：登录 Windows 20 秒后检查一次，之后每分钟检查一次
-- **掉线自动重连**：断网后 1 分钟内自动恢复
+- **开机自动登录**：登录 Windows 8 秒后检查一次，之后每 15 秒检查一次
+- **掉线自动重连**：断网后 15 秒内自动恢复
 - **两套认证流程都支持**：Dr.COM 门户表单（有线/无线通用）和统一身份认证（CAS）
   - ⚠️ 有线走 CAS 时，提交后的「安全验证」**不一定是拼图滑块**——部分账号会遇到**人脸识别**
     （`loginType=4`，需要真人对着摄像头），自动化无法完成。详见 [docs/技术细节.md](docs/技术细节.md)
@@ -24,8 +25,11 @@
   实测学校是按**账号**限制的：学生账号（学号 `B` 开头）只有周六日 24 小时可用，
   教师账号（工号 `M` 开头）所有时段都可用 —— 所以 `M` 开头的账号不受这个限制，
   半夜掉线照样自动重连
-- **失败退避**：登录失败后按 2/5/15/30 分钟放慢重试，日志不会被刷屏
-- **密码只存本机**：Windows 用 DPAPI 加密（浏览器模式）或本地文件（HTTP 模式），不上传任何地方
+- **失败退避**：登录失败后按 30/60 秒放慢重试（最长 60 秒），日志不会被刷屏
+- **密码只存本机**：两种模式都用 Windows DPAPI 加密，只有当前 Windows 用户能解开，不上传任何地方
+  （更早版本保存的 `secret.json` 会在下次读取时自动升级成加密格式）
+- **失败会提醒**：连续失败 3 次弹一条通知，不用等自己发现上不了网
+- **日志不会撑爆**：日志按大小滚动，失败时存档的页面和截图只留最近 30 份
 
 ---
 
@@ -33,8 +37,12 @@
 
 ### 方式一：下载安装包（推荐，零依赖）
 
-在 [Releases](../../releases) 里下载 `NUA-Campus-Network-Auto-Login_v*_standard.zip`（约 13MB，**自带 Python 运行环境**），
+在 [Releases](../../releases) 里下载 **Windows 标准版** —— 也就是文件名里带 `windows` 的那个
+（`NUA-Campus-Network-Auto-Login_v*_windows_standard.zip`，约 13MB，**自带 Python 运行环境**），
 解压后双击 `AAA一键安装.bat`，按向导输入校园网账号密码即可。
+
+> 适用的系统是 **Windows 10 / 11（64 位）**。更老的系统（Windows 7 / 32 位）没实测过，
+> 包里自带的是 64 位 Python 运行环境，不保证能跑起来。
 
 ### 方式二：从源码运行
 
@@ -182,7 +190,7 @@ python campus_http.py --probe --bind wifi
 
 几个高频问题：
 
-- **晚上 12 点断网能解决吗？** 不能——那是学校的账号策略。工具会在断网后 1 分钟内重连，
+- **晚上 12 点断网能解决吗？** 不能——那是学校的账号策略。工具会在断网后 15 秒内重连，
   但学生账号夜间能否重新认证由学校决定。工具默认在 00:00–06:00 干脆不尝试，避免无谓请求。
   实测教师账号夜间正常可用，所以有教师账号的话可以用教师模式整夜跑（见
   [docs/实测结论与经验教训.md](docs/实测结论与经验教训.md)）。

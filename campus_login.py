@@ -25,16 +25,19 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import ctypes
 import ctypes.wintypes as wt
 import datetime
 import getpass
 import json
 import logging
+import logging.handlers
 import os
 import pathlib
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -58,10 +61,10 @@ DEFAULT_CONFIG = {
     # 是否强制要求出口地址在校园网段内。默认关闭: 门户能加载已经说明在校园网,
     # 地址判断只作为提示(校园网可能有多个网段, 写死了会误伤)。
     "require_campus_ip": False,
-    "interval": 30,
+    "interval": 15,
     "headless": True,
     "login_timeout": 90,
-    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每分钟去试
+    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每 15 秒去试
     # days 用 Python 的星期编号：0=周一 … 6=周日。默认周一~周五 00:00-06:00
     "quiet_hours": {
         "enabled": True,
@@ -75,8 +78,14 @@ DEFAULT_CONFIG = {
     # 两张校园网（移动/电信）上学生账号和教师账号是混着用的，所以按**账号**判断，不按网段。
     "teacher_account_prefixes": ["M"],
     "quiet_hours_exempt_accounts": [],
-    # 登录失败后的退避秒数：2 分钟、5 分钟、15 分钟、30 分钟（之后一直 30 分钟）
-    "failure_backoff": [120, 300, 900, 1800],
+    # 登录失败后的退避秒数：依次 30 秒、60 秒（之后一直 60 秒），最长不超过 60 秒
+    "failure_backoff": [30, 60],
+    # 连续失败达到这么多次后弹一次 Windows 通知（0 = 不弹）
+    "notify_after_failures": 3,
+    # 日志轮转 / 截图存档保留策略
+    "log_max_kb": 2048,
+    "log_backups": 3,
+    "screenshot_keep": 30,
 }
 
 log = logging.getLogger("campus")
@@ -97,19 +106,42 @@ RETRY_FILE = LOG_DIR / "retry_state.json"
 MODE_FILE = LOG_DIR / "last_mode.txt"
 LOCK_STALE_SECONDS = 900
 
+# 这台机器能不能用 Windows 通知（Linux 上是 False）
+IS_WINDOWS = sys.platform.startswith("win")
 
-def setup_logging(verbose: bool = True) -> None:
+# 日志与截图存档的保留策略，默认值；可在 config.json 里覆盖
+LOG_MAX_KB = 2048
+LOG_BACKUPS = 3
+SHOT_KEEP = 30
+
+
+def _cfg_int(cfg: dict, key: str, default: int) -> int:
+    """从配置里取一个非负整数，取不到或写错就用默认值。"""
+    try:
+        return max(int(cfg.get(key, default)), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def setup_logging(verbose: bool = True, cfg: dict | None = None) -> None:
+    global LOG_MAX_KB, LOG_BACKUPS, SHOT_KEEP
+    cfg = cfg or {}
     LOG_DIR.mkdir(exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    log_file = LOG_DIR / "campus_login.log"
-    try:
-        if log_file.exists() and log_file.stat().st_size > 2 * 1024 * 1024:
-            log_file.replace(LOG_DIR / "campus_login.log.1")
-    except OSError:
-        pass
+    LOG_MAX_KB = _cfg_int(cfg, "log_max_kb", LOG_MAX_KB)
+    LOG_BACKUPS = _cfg_int(cfg, "log_backups", LOG_BACKUPS)
+    SHOT_KEEP = _cfg_int(cfg, "screenshot_keep", SHOT_KEEP)
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    log_file = LOG_DIR / "campus_login.log"
+    if LOG_MAX_KB > 0:
+        # 原来只是把满 2MB 的日志挪成 .1（下一个 2MB 又把上一个顶掉），
+        # 现在改成标准的滚动日志，保留几份历史
+        fh = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=LOG_MAX_KB * 1024, backupCount=LOG_BACKUPS, encoding="utf-8"
+        )
+    else:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(fmt)
     log.addHandler(fh)
 
@@ -171,6 +203,59 @@ def load_secret() -> tuple[str, str]:
         raise SystemExit("还没有保存账号密码, 请先运行: python campus_login.py --set-password")
     obj = json.loads(dpapi_unprotect(SECRET_FILE.read_bytes()).decode("utf-8"))
     return obj["account"], obj["password"]
+
+
+# --------------------------------------------------------------------------- #
+# 失败通知：用户不会盯着日志看，连续失败得主动提醒一下
+# --------------------------------------------------------------------------- #
+def notify(title: str, message: str) -> None:
+    """
+    弹一条 Windows 通知（托盘气泡）。只在 Windows 上有效，失败就静默忽略。
+
+    用 -EncodedCommand 传脚本，避免中文和引号在命令行里被 PowerShell 拆坏；
+    CREATE_NO_WINDOW 保证不会闪一个黑框出来。
+    """
+    if not IS_WINDOWS:
+        return
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        "$n = New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon = [System.Drawing.SystemIcons]::Warning;"
+        "$n.Visible = $true;"
+        "$n.ShowBalloonTip(15000, '%s', '%s', 'Warning');"
+        "Start-Sleep -Seconds 12;"
+        "$n.Dispose()" % (title.replace("'", "''"), message.replace("'", "''"))
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def maybe_notify_failure(cfg: dict, failures: int) -> bool:
+    """
+    连续失败达到阈值时弹一次通知（不再重复弹）。
+
+    返回值配合 retry_state 里的 notified 字段使用，成功一次后会随退避状态一起清掉。
+    配置 notify_after_failures（默认 3，设 0 关掉）。
+    """
+    limit = _cfg_int(cfg, "notify_after_failures", 3)
+    if limit <= 0 or failures < limit:
+        return False
+    notify(
+        "校园网自动登录失败",
+        f"已经连续 {failures} 次认证失败。请确认校园网密码有没有改过；"
+        "如果密码没错，也可能是这个账号在别的设备上登录、占满了并发数。"
+        "详细过程见 logs\\campus_login.log",
+    )
+    return True
 
 
 def load_config() -> dict:
@@ -301,7 +386,7 @@ def evaluate_state(cfg: dict) -> tuple[str, str]:
 
 
 def note_state(state: str, detail: str, always: bool = False) -> bool:
-    """状态变化时才写日志, 避免计划任务每分钟刷屏。返回是否发生变化。"""
+    """状态变化时才写日志, 避免计划任务每 15 秒刷屏。返回是否发生变化。"""
     previous = None
     try:
         previous = STATE_FILE.read_text(encoding="utf-8").split(" ", 1)[0] or None
@@ -436,9 +521,17 @@ def clear_retry() -> None:
 
 
 def backoff_seconds(cfg: dict, failures: int) -> int:
-    table = cfg.get("failure_backoff") or [120]
+    table = cfg.get("failure_backoff") or [30, 60]
     idx = min(max(failures, 1), len(table)) - 1
     return int(table[idx])
+
+
+def format_wait(seconds: float) -> str:
+    """把剩余等待时间写成"多少秒/多少分钟"，不足 1 分钟就按秒显示。"""
+    secs = max(int(round(seconds)), 0)
+    if secs < 60:
+        return f"{secs} 秒"
+    return f"{int(secs // 60) + (1 if secs % 60 else 0)} 分钟"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -599,11 +692,27 @@ def _solve_slider(page) -> str:
     return "forced" if _slider_ok(page) else "failed"
 
 
+def _prune_files(directory: pathlib.Path, pattern: str, keep: int) -> None:
+    """只保留最近 keep 个文件 —— 反复掉线重连时，截图/存档会一直堆下去。"""
+    if keep <= 0:
+        return
+    try:
+        old = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime)
+        for stale in old[:-keep]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _shot(page, tag: str) -> pathlib.Path | None:
     try:
         SHOT_DIR.mkdir(exist_ok=True)
         path = SHOT_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.png"
         page.screenshot(path=str(path), full_page=True)
+        _prune_files(SHOT_DIR, "*.png", SHOT_KEEP)
         return path
     except Exception:
         return None
@@ -615,6 +724,7 @@ def _dump_page(page, tag: str) -> pathlib.Path | None:
         LOG_DIR.mkdir(exist_ok=True)
         path = LOG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.html"
         path.write_text(page.content(), encoding="utf-8")
+        _prune_files(LOG_DIR, "*.html", SHOT_KEEP)
         return path
     except Exception:
         return None
@@ -963,7 +1073,7 @@ def cmd_login(cfg: dict) -> int:
     三层"少打扰"处理（与纯 HTTP 版一致）：
       1. 夜间限制时段（默认周一~周五 00:00-06:00）直接不尝试
       2. 已经在线 / 不在校园网 都不尝试
-      3. 登录失败后按 2/5/15/30 分钟退避
+      3. 登录失败后按 30/60 秒退避（最长 60 秒）
     """
     now_ts = time.time()
 
@@ -987,9 +1097,9 @@ def cmd_login(cfg: dict) -> int:
     retry = load_retry()
     next_attempt = float(retry.get("next_attempt", 0) or 0)
     if next_attempt > now_ts:
-        minutes = int((next_attempt - now_ts) // 60) + 1
         note_mode(f"backoff-{int(next_attempt)}",
-                  f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                  f"上次登录失败（累计 {retry.get('failures')} 次），"
+                  f"{format_wait(next_attempt - now_ts)}后再试")
         return 0
 
     note_mode("normal", "恢复正常检查，开始尝试登录")
@@ -999,17 +1109,24 @@ def cmd_login(cfg: dict) -> int:
         return 0
     failures = int(retry.get("failures", 0)) + 1
     delay = backoff_seconds(cfg, failures)
-    save_retry({"failures": failures, "next_attempt": now_ts + delay})
+    notified = bool(retry.get("notified")) or maybe_notify_failure(cfg, failures)
+    save_retry({"failures": failures, "next_attempt": now_ts + delay, "notified": notified})
     log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
     return 1
 
 
 def cmd_watch(cfg: dict) -> int:
-    interval = int(cfg.get("interval", 30))
-    account, password = load_secret()
-    log.info("看门狗启动, 每 %s 秒检测一次", interval)
+    """
+    常驻看门狗：登录 Windows 后由计划任务启动一次，之后一直在这个进程里循环。
+
+    因为进程常驻，每轮都重新读 config.json 和 secret.bin —— 改完配置、
+    或者重新设置过密码，不用重启进程就生效。
+    """
+    log.info("看门狗启动, 每 %s 秒检测一次", cfg.get("interval", 15))
     while True:
         try:
+            cfg = load_config()
+            account, password = load_secret()
             if in_quiet_hours(cfg, account=account):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段（{quiet.get('start', '00:00')}-{quiet.get('end', '06:00')}），"
@@ -1027,9 +1144,9 @@ def cmd_watch(cfg: dict) -> int:
                 retry = load_retry()
                 next_attempt = float(retry.get("next_attempt", 0) or 0)
                 if next_attempt > time.time():
-                    minutes = int((next_attempt - time.time()) // 60) + 1
                     note_mode(f"backoff-{int(next_attempt)}",
-                              f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                              f"上次登录失败（累计 {retry.get('failures')} 次），"
+                              f"{format_wait(next_attempt - time.time())}后再试")
                 else:
                     note_mode("normal", "恢复正常检查，开始尝试登录")
                     if do_login(cfg, account, password):
@@ -1037,11 +1154,20 @@ def cmd_watch(cfg: dict) -> int:
                     else:
                         failures = int(retry.get("failures", 0)) + 1
                         delay = backoff_seconds(cfg, failures)
-                        save_retry({"failures": failures, "next_attempt": time.time() + delay})
+                        notified = bool(retry.get("notified")) or maybe_notify_failure(cfg, failures)
+                        save_retry({"failures": failures,
+                                    "next_attempt": time.time() + delay,
+                                    "notified": notified})
                         log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
+        except SystemExit as exc:
+            # 账号密码还没保存、或者 secret.bin 解不开：别让常驻进程整个退出，
+            # 等用户弄好之后自动接上
+            log.error("看门狗暂停：%s", exc)
+            time.sleep(300)
+            continue
         except Exception as exc:
             log.exception("看门狗循环异常: %s", exc)
-        time.sleep(interval)
+        time.sleep(int(cfg.get("interval", 15)))
 
 
 def main() -> int:
@@ -1062,8 +1188,8 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true", help="不输出到控制台(供计划任务调用)")
     args = parser.parse_args()
 
-    setup_logging(verbose=not args.quiet)
     cfg = load_config()
+    setup_logging(verbose=not args.quiet, cfg=cfg)
     if args.show:
         cfg["headless"] = False
     if args.interval:

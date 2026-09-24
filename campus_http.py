@@ -27,10 +27,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
+import ctypes.wintypes as wt
 import datetime
 import http.cookiejar
 import json
 import logging
+import logging.handlers
 import pathlib
 import re
 import ssl
@@ -47,6 +51,14 @@ SECRET_FILE = APP_DIR / "secret.json"
 CONFIG_FILE = APP_DIR / "config.json"
 RETRY_FILE = LOG_DIR / "retry_state.json"
 MODE_FILE = LOG_DIR / "last_mode.txt"
+
+# 这台机器能不能用 Windows 专有的加密 / 通知（Linux、路由器上是 False）
+IS_WINDOWS = sys.platform.startswith("win")
+
+# 日志与页面存档的保留策略，默认值；可在 config.json 里覆盖
+LOG_MAX_KB = 1024        # 单个日志文件的上限
+LOG_BACKUPS = 3          # 轮转后保留几个历史日志
+DUMP_KEEP = 30           # 失败时存档的页面只留最近这么多份
 
 # 学校统一身份认证页面里写死的 RSA 公钥（指数 010001，模数见下）
 MODULUS_HEX = (
@@ -67,10 +79,10 @@ DEFAULT_CONFIG = {
     # 脚本会优先从验证页里解析 contextPath 自动拼接，这里的值只是后备。
     "captcha_url": "https://c.nua.edu.cn/cas/captchValid/checkCaptchImg",
     "probe_url": "http://www.baidu.com/",
-    "interval": 60,
+    "interval": 15,
     "login_timeout": 90,
     "timeout": 8,
-    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每分钟去试
+    # 夜间限制时段：这段时间学校不允许学生账号认证，就没必要每 15 秒去试
     # days 用 Python 的星期编号：0=周一 … 6=周日。默认周一~周五的 00:00-06:00，
     # 正好覆盖"周日到周四晚上 24 点断网"的常见策略（周一 0 点~周五 6 点）。
     "quiet_hours": {
@@ -85,8 +97,14 @@ DEFAULT_CONFIG = {
     # 两张校园网（移动/电信）上学生账号和教师账号是混着用的，所以按**账号**判断，不按网段。
     "teacher_account_prefixes": ["M"],
     "quiet_hours_exempt_accounts": [],
-    # 登录失败后的退避秒数：依次 2 分钟、5 分钟、15 分钟、30 分钟（之后一直 30 分钟）
-    "failure_backoff": [120, 300, 900, 1800],
+    # 登录失败后的退避秒数：依次 30 秒、60 秒（之后一直 60 秒），最长不超过 60 秒
+    "failure_backoff": [30, 60],
+    # 连续失败达到这么多次后弹一次 Windows 通知（0 = 不弹）
+    "notify_after_failures": 3,
+    # 日志轮转 / 页面存档保留策略
+    "log_max_kb": 1024,
+    "log_backups": 3,
+    "page_dump_keep": 30,
 }
 
 USER_AGENT = (
@@ -146,10 +164,32 @@ def rsa_encrypt(password: str) -> str:
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
-def setup_logging(verbose: bool = True) -> None:
+def _cfg_int(cfg: dict, key: str, default: int) -> int:
+    """从配置里取一个非负整数，取不到或写错就用默认值。"""
+    try:
+        return max(int(cfg.get(key, default)), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def setup_logging(verbose: bool = True, cfg: dict | None = None) -> None:
+    global LOG_MAX_KB, LOG_BACKUPS, DUMP_KEEP
+    cfg = cfg or {}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_DIR / "campus_http.log", encoding="utf-8")
+
+    LOG_MAX_KB = _cfg_int(cfg, "log_max_kb", LOG_MAX_KB)
+    LOG_BACKUPS = _cfg_int(cfg, "log_backups", LOG_BACKUPS)
+    DUMP_KEEP = _cfg_int(cfg, "page_dump_keep", DUMP_KEEP)
+
+    log_file = LOG_DIR / "campus_http.log"
+    if LOG_MAX_KB > 0:
+        # 每 15 秒检查一次，日志不轮转的话跑几个月能涨到几百 MB
+        fh = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=LOG_MAX_KB * 1024, backupCount=LOG_BACKUPS, encoding="utf-8"
+        )
+    else:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(fmt)
     log.addHandler(fh)
     if verbose and sys.stdout is not None:
@@ -157,6 +197,104 @@ def setup_logging(verbose: bool = True) -> None:
         sh.setFormatter(fmt)
         log.addHandler(sh)
     log.setLevel(logging.INFO)
+
+
+# --------------------------------------------------------------------------- #
+# 密码保护（Windows DPAPI）+ 失败通知
+#
+# 纯 HTTP 模式现在也用 Windows DPAPI 加密保存密码，和浏览器模式一致：
+# 只有当前 Windows 用户能解开，复制到别的机器 / 换个 Windows 用户都用不了。
+# 更早版本保存的 secret.json 会在下次读取时自动升级到加密格式。
+# 非 Windows（路由器 / Linux）上 DPAPI 不存在，只能沿用明文保存。
+# --------------------------------------------------------------------------- #
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _blob_to_bytes(blob: "_DATA_BLOB") -> bytes:
+    return ctypes.string_at(blob.pbData, blob.cbData)
+
+
+def dpapi_protect(data: bytes) -> bytes:
+    """用当前 Windows 用户的密钥加密数据。"""
+    buf = ctypes.create_string_buffer(data)
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    )
+    if not ok:
+        raise OSError("CryptProtectData 失败")
+    try:
+        return _blob_to_bytes(blob_out)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def dpapi_unprotect(data: bytes) -> bytes:
+    """解密 dpapi_protect 加密的数据。"""
+    buf = ctypes.create_string_buffer(data)
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    )
+    if not ok:
+        raise OSError("CryptUnprotectData 失败: 可能换了 Windows 用户或换了机器")
+    try:
+        return _blob_to_bytes(blob_out)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def notify(title: str, message: str) -> None:
+    """
+    弹一条 Windows 通知（托盘气泡）。只在 Windows 上有效，失败就静默忽略。
+
+    用 -EncodedCommand 传脚本，避免中文和引号在命令行里被 PowerShell 拆坏；
+    CREATE_NO_WINDOW 保证不会闪一个黑框出来。
+    """
+    if not IS_WINDOWS:
+        return
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        "$n = New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon = [System.Drawing.SystemIcons]::Warning;"
+        "$n.Visible = $true;"
+        "$n.ShowBalloonTip(15000, '%s', '%s', 'Warning');"
+        "Start-Sleep -Seconds 12;"
+        "$n.Dispose()" % (title.replace("'", "''"), message.replace("'", "''"))
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def maybe_notify_failure(cfg: dict, failures: int) -> bool:
+    """
+    连续失败达到阈值时弹一次通知，避免"用户压根不知道在失败"。
+
+    返回是否已经通知过 —— 调用方把它记进 retry_state，成功一次后随退避状态一起清掉。
+    配置 notify_after_failures（默认 3，设 0 关掉）。
+    """
+    limit = _cfg_int(cfg, "notify_after_failures", 3)
+    if limit <= 0 or failures < limit:
+        return False
+    notify(
+        "校园网自动登录失败",
+        f"已经连续 {failures} 次认证失败。请确认校园网密码有没有改过；"
+        "如果密码没错，也可能是这个账号在别的设备上登录、占满了并发数。"
+        "详细过程见 logs\\campus_http.log",
+    )
+    return True
 
 
 def load_config() -> dict:
@@ -287,15 +425,29 @@ def clear_retry() -> None:
 
 
 def backoff_seconds(cfg: dict, failures: int) -> int:
-    table = cfg.get("failure_backoff") or [120]
+    table = cfg.get("failure_backoff") or [30, 60]
     idx = min(max(failures, 1), len(table)) - 1
     return int(table[idx])
 
 
+def format_wait(seconds: float) -> str:
+    """把剩余等待时间写成"多少秒/多少分钟"，不足 1 分钟就按秒显示。"""
+    secs = max(int(round(seconds)), 0)
+    if secs < 60:
+        return f"{secs} 秒"
+    return f"{int(secs // 60) + (1 if secs % 60 else 0)} 分钟"
+
+
 def save_secret(account: str, password: str) -> None:
-    SECRET_FILE.write_text(
-        json.dumps({"account": account, "password": password}), encoding="utf-8"
-    )
+    payload = json.dumps({"account": account, "password": password}, ensure_ascii=False)
+    if IS_WINDOWS:
+        # 用当前 Windows 用户的密钥加密：复制到别的机器 / 别的用户都解不开
+        blob = base64.b64encode(dpapi_protect(payload.encode("utf-8"))).decode("ascii")
+        text = json.dumps({"enc": "dpapi", "blob": blob})
+    else:
+        # 路由器 / Linux 上没有 DPAPI，只能沿用明文（这些平台本来也是这么存的）
+        text = payload
+    SECRET_FILE.write_text(text, encoding="utf-8")
     try:
         SECRET_FILE.chmod(0o600)
     except OSError:
@@ -305,7 +457,25 @@ def save_secret(account: str, password: str) -> None:
 def load_secret() -> tuple[str, str]:
     if not SECRET_FILE.exists():
         raise SystemExit("还没有保存账号密码，请先运行: python campus_http.py --set-password")
-    obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+    try:
+        obj = json.loads(SECRET_FILE.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise SystemExit(f"读不懂 {SECRET_FILE.name}（{exc}），请重新运行 --set-password") from exc
+
+    if obj.get("enc") == "dpapi":
+        if not IS_WINDOWS:
+            raise SystemExit(
+                f"{SECRET_FILE.name} 是 Windows 加密保存的，当前系统解不开；"
+                "请在这台机器上重新运行 --set-password"
+            )
+        obj = json.loads(dpapi_unprotect(base64.b64decode(obj["blob"])).decode("utf-8"))
+    elif IS_WINDOWS:
+        # 更早版本保存的 secret.json 还是旧格式：读得出来就顺手升级成加密存储
+        try:
+            save_secret(obj["account"], obj["password"])
+            log.info("已把 %s 升级成 Windows 加密保存", SECRET_FILE.name)
+        except (KeyError, OSError, TypeError):
+            pass
     return obj["account"], obj["password"]
 
 
@@ -647,6 +817,14 @@ def _dump(tag: str, text: str) -> None:
         path = LOG_DIR / f"http-{time.strftime('%Y%m%d-%H%M%S')}-{tag}.html"
         path.write_text(text, encoding="utf-8")
         log.info("页面已存档: %s", path.name)
+        # 登录一直失败时这些存档会飞快堆积（15 秒一轮），只留最近的若干份
+        if DUMP_KEEP > 0:
+            old = sorted(LOG_DIR.glob("http-*.html"), key=lambda p: p.stat().st_mtime)
+            for stale in old[:-DUMP_KEEP]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
     except OSError:
         pass
 
@@ -932,15 +1110,26 @@ def cmd_set_password() -> None:
     if not password:
         raise SystemExit("密码不能为空")
     save_secret(account, password)
-    print(f"已保存到 {SECRET_FILE}（建议 chmod 600）")
+    if IS_WINDOWS:
+        print(f"已保存到 {SECRET_FILE}（用当前 Windows 用户加密，换机器/换用户都解不开）")
+    else:
+        print(f"已保存到 {SECRET_FILE}（当前系统没有 DPAPI，只能明文保存，建议 chmod 600）")
 
 
 def cmd_watch(cfg: dict, bind_ip: str | None = None) -> int:
+    """
+    常驻看门狗：登录 Windows 后由计划任务启动一次，之后一直在这个进程里按
+    interval 循环（不再每 15 秒拉一个新进程）。
+
+    正因为是常驻的，每轮都重新读 config.json 和 secret.json —— 改完配置、
+    或者重新设置过密码，不用重启进程就生效。
+    """
     sess = Session(cfg["timeout"], bind_ip=bind_ip)
-    account, password = load_secret()
     log.info("看门狗启动，每 %s 秒检测一次", cfg["interval"])
     while True:
         try:
+            cfg = load_config()
+            account, password = load_secret()
             if in_quiet_hours(cfg, account=account):
                 quiet = cfg.get("quiet_hours") or {}
                 note_mode("quiet", f"进入夜间限制时段({quiet.get('start','00:00')}-{quiet.get('end','06:00')})，"
@@ -954,18 +1143,27 @@ def cmd_watch(cfg: dict, bind_ip: str | None = None) -> int:
                 retry = load_retry()
                 next_attempt = float(retry.get("next_attempt", 0) or 0)
                 if next_attempt > time.time():
-                    minutes = int((next_attempt - time.time()) // 60) + 1
                     note_mode(f"backoff-{int(next_attempt)}",
-                              f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                              f"上次登录失败（累计 {retry.get('failures')} 次），"
+                              f"{format_wait(next_attempt - time.time())}后再试")
                 else:
                     note_mode("normal", "恢复正常检查，开始尝试登录")
                     if not login(sess, cfg, account, password):
                         failures = int(retry.get("failures", 0)) + 1
                         delay = backoff_seconds(cfg, failures)
-                        save_retry({"failures": failures, "next_attempt": time.time() + delay})
+                        notified = bool(retry.get("notified")) or maybe_notify_failure(cfg, failures)
+                        save_retry({"failures": failures,
+                                    "next_attempt": time.time() + delay,
+                                    "notified": notified})
                         log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
                     else:
                         clear_retry()
+        except SystemExit as exc:
+            # 账号密码还没保存、或者 secret.json 解不开：别让常驻进程整个退出，
+            # 等用户弄好之后自动接上
+            log.error("看门狗暂停：%s", exc)
+            time.sleep(300)
+            continue
         except Exception as exc:
             log.exception("循环异常: %s", exc)
         time.sleep(int(cfg["interval"]))
@@ -978,7 +1176,7 @@ def cmd_login(cfg: dict, bind_ip: str | None = None) -> int:
     这里做了三层"少打扰"处理：
       1. 夜间限制时段（默认周一~周五 00:00-06:00）直接不尝试
       2. 已经在线 / 不在校园网 都不尝试
-      3. 登录失败后按 2/5/15/30 分钟退避，避免每分钟都去撞墙
+      3. 登录失败后按 30/60 秒退避（最长 60 秒），避免每 15 秒都去撞墙
     每种情况只在"状态变化"时写一行日志。
 
     bind_ip 不为空 = 手动指定出口（比如让认证走无线网卡）。
@@ -1005,9 +1203,9 @@ def cmd_login(cfg: dict, bind_ip: str | None = None) -> int:
     retry = {} if bind_ip else load_retry()
     next_attempt = float(retry.get("next_attempt", 0) or 0)
     if next_attempt > now_ts:
-        minutes = int((next_attempt - now_ts) // 60) + 1
         note_mode(f"backoff-{int(next_attempt)}",
-                  f"上次登录失败（累计 {retry.get('failures')} 次），{minutes} 分钟后再试")
+                  f"上次登录失败（累计 {retry.get('failures')} 次），"
+                  f"{format_wait(next_attempt - now_ts)}后再试")
         return 0
 
     note_mode("normal", "恢复正常检查，开始尝试登录")
@@ -1018,7 +1216,8 @@ def cmd_login(cfg: dict, bind_ip: str | None = None) -> int:
 
     failures = int(retry.get("failures", 0)) + 1
     delay = backoff_seconds(cfg, failures)
-    save_retry({"failures": failures, "next_attempt": now_ts + delay})
+    notified = bool(retry.get("notified")) or (maybe_notify_failure(cfg, failures) if not bind_ip else False)
+    save_retry({"failures": failures, "next_attempt": now_ts + delay, "notified": notified})
     log.warning("登录失败，%s 秒内不再重试（累计失败 %s 次）", delay, failures)
     return 1
 
@@ -1042,8 +1241,8 @@ def main() -> int:
     except Exception:
         pass
 
-    setup_logging(verbose=not args.quiet)
     cfg = load_config()
+    setup_logging(verbose=not args.quiet, cfg=cfg)
 
     try:
         if args.set_password:
