@@ -4,7 +4,7 @@
 打包 OpenWrt 版：把 openwrt/ 目录压成一个 zip。
 
     python tools/make_release_openwrt.py             # 版本号取仓库里的（见下）
-    python tools/make_release_openwrt.py --version 1.4
+    python tools/make_release_openwrt.py --version 1.5
 
 产物（Release 资产名必须纯英文，见 docs/发版流程.md）：
     NUA-Campus-Network-Auto-Login_v1.4_openwrt.zip

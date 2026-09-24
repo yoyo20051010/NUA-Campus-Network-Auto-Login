@@ -108,7 +108,7 @@ DEFAULT_CONFIG = {
     "pinned_hosts": {},
     "drcom_extra_query": {},
     # 本机版本号(与 Release 的 tag 一致), 用于"检查更新"
-    "version": "v1.4-macos",
+    "version": "v1.5-macos",
     # 无线门户的"服务类型": 留空=依次试 校园用户/@njxy/@dx/@lt
     "wifi_suffix": "",
     # 有线网段默认也走 Dr.COM 表单 —— 实测(2026-09-15)可行,
@@ -1903,7 +1903,7 @@ def release_lock() -> None:
 # --------------------------------------------------------------------------- #
 # 版本 / 通知 / 更新检查
 # --------------------------------------------------------------------------- #
-VERSION = "v1.4-macos"
+VERSION = "v1.5-macos"
 DEFAULT_UPDATE_API = ("https://api.github.com/repos/yoyo20051010/"
                       "NUA-Campus-Network-Auto-Login/releases?per_page=10")
 UPDATE_CHECK_FILE = STATE_DIR / "update_check.json"

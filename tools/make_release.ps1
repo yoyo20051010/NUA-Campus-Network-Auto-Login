@@ -19,7 +19,7 @@ if (-not (Test-Path (Join-Path $AppDir 'campus_http.py'))) {
     # 脚本放在 tools/ 时，仓库根目录在上一层
     $AppDir = Split-Path -Parent $AppDir
 }
-$Version = '1.4'
+$Version = '1.5'
 
 function Build-Package {
     param([bool]$IsLite)
