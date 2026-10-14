@@ -377,16 +377,33 @@ int routeTableFor(const std::string& name) {
 
 namespace {
 
+// /proc/net/route 是**制表符**分隔的（不是空格），按任意空白切分才拿得到字段。
+// 这里踩过坑：早先用 split(line, ' ') 切，整行只切出 1 个字段，于是每行都
+// continue，defaultGateway() 永远返回空 —— 策略路由（from <ip> lookup <表>）
+// 从来没装上，多线路的请求全顺着默认路由从有线跑掉了。
+std::vector<std::string> splitFields(const std::string& line) {
+    std::vector<std::string> out;
+    std::string current;
+    for (char c : line) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (!current.empty()) {
+                out.push_back(current);
+                current.clear();
+            }
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) out.push_back(current);
+    return out;
+}
+
 // 从 /proc/net/route 里取某张网卡的默认网关（直接读文件，省一次 fork）
 std::string defaultGateway(const std::string& device) {
     std::string content;
     if (!readFile("/proc/net/route", content)) return "";
     for (const std::string& line : split(content, '\n')) {
-        const std::vector<std::string> cells = split(trim(line), ' ');
-        std::vector<std::string> compact;
-        for (const std::string& cell : cells) {
-            if (!cell.empty()) compact.push_back(cell);
-        }
+        const std::vector<std::string> compact = splitFields(line);
         if (compact.size() < 3) continue;
         if (compact[0] != device) continue;
         if (compact[1] != "00000000") continue;  // 目的地址全 0 = 默认路由
